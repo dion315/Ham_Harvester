@@ -570,7 +570,7 @@ class App:
             verbose=self.verbose.get(),
         )
         self.worker.daemon = True
-               self.worker.start()
+        self.worker.start()
 
     def stop(self):
         if self.worker:
@@ -620,7 +620,7 @@ class App:
         # stable, friendly column order
         preferred = ["callsign", "fname", "addr1", "addr2", "city", "state", "zipcode", "country", "address", "lat", "lon"]
         present = set().union(*(r.keys() for r in self.records))
-        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred)]
+        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
         try:
             with open(p, "w", newline="", encoding="utf-8") as fh:
                 w = csv.DictWriter(fh, fieldnames=fieldnames)
