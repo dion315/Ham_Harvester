@@ -132,12 +132,13 @@ def geocode_google(address, api_key, verbose=False):
     loc = j["results"][0]["geometry"]["location"]
     return loc["lat"], loc["lng"]
 
-<<<<<<< HEAD
 # ---------- QRZ XML API logic ----------
 
 QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
+QRZ_XML_LOGIN_URL = QRZ_XML_BASE
+USER_AGENT = "QRZ-Mapper/1.0"
 
-=======
+
 # Simple XML helper that ignores namespaces when searching for tags.
 def find_first(elem, *tag_names):
     """Return the first descendant whose local-name matches any of ``tag_names``."""
@@ -161,112 +162,92 @@ def find_text(elem, *tag_names):
 
 
 # QRZ XML API: login to get session key
->>>>>>> refs/remotes/origin/main
 def qrz_login(username, password, verbose=False):
     """
     Logs into QRZ XML API using username/password, returns session key.
     """
     if verbose:
-<<<<<<< HEAD
-        print("[qrz_login] attempting via XML POST")
-    # XML payload
-    payload = f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD></QRZDatabase>"
-    headers = {"Content-Type": "application/xml", "User-Agent": "QRZ-Mapper/1.0"}
-    resp = requests.post(QRZ_XML_BASE, data=payload, headers=headers, timeout=20)
-    if resp.status_code != 200:
-        raise RuntimeError(f"QRZ login HTTP {resp.status_code}")
-    root = ET.fromstring(resp.text)
-    session = root.find(".//Session")
-    if session is not None and session.text:
-        key = session.text.strip()
-        if verbose:
-            print(f"[qrz_login] got session key: {key}")
-        return key
-    # fallback: try GET style
-    if verbose:
-        print("[qrz_login] XML POST failed, trying GET fallback")
-    resp2 = requests.get(QRZ_XML_BASE, params={"username": username, "password": password}, headers={"User-Agent": "QRZ-Mapper/1.0"}, timeout=20)
-    root2 = ET.fromstring(resp2.text)
-    session2 = root2.find(".//Session")
-    if session2 is not None and session2.text:
-        return session2.text.strip()
-    raise RuntimeError("QRZ login failed; check credentials and XML privileges")
-=======
         print("[qrz_login] attempting login")
+
+    def parse_session_key(xml_text):
+        root = ET.fromstring(xml_text)
+        session = find_first(root, "Session")
+        key = find_text(session, "Key") if session is not None else ""
+        if not key and session is not None and session.text:
+            key = session.text.strip()
+        return key
+
     # QRZ XML login is performed by POSTing an XML request to the XML endpoint and parsing.
-    # The simple documented approach: use requests.post to QRZ_XML_LOGIN_URL with data containing username/password.
     # Some users place credentials as URL params; implement both fallback approaches.
     try:
-        # First try the documented XML login POST
-        xml_payload = f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD><OPTIONS><keeplogin>1</keeplogin></OPTIONS></QRZDatabase>"
-        resp = requests.post(QRZ_XML_LOGIN_URL, data=xml_payload, headers={"Content-Type": "application/xml", "User-Agent": USER_AGENT}, timeout=20)
+        xml_payload = (
+            f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD>"
+            "<OPTIONS><keeplogin>1</keeplogin></OPTIONS></QRZDatabase>"
+        )
+        resp = requests.post(
+            QRZ_XML_LOGIN_URL,
+            data=xml_payload,
+            headers={"Content-Type": "application/xml", "User-Agent": USER_AGENT},
+            timeout=20,
+        )
         if resp.status_code != 200:
             raise RuntimeError(f"QRZ login HTTP {resp.status_code}")
-        root = ET.fromstring(resp.text)
-        session = find_first(root, "Session")
-        key_text = find_text(session, "Key") if session is not None else ""
-        if key_text:
-            key = key_text
+        key = parse_session_key(resp.text)
+        if key:
             if verbose:
                 print("[qrz_login] obtained session key")
             return key
     except Exception as e:
         if verbose:
             print("[qrz_login] xml-post method failed:", e)
+
     # Fallback: try GET style (older installations used query params)
     try:
         params = {"username": username, "password": password}
-        resp2 = requests.get(QRZ_XML_LOGIN_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
+        resp2 = requests.get(
+            QRZ_XML_LOGIN_URL,
+            params=params,
+            headers={"User-Agent": USER_AGENT},
+            timeout=20,
+        )
         if resp2.status_code != 200:
             raise RuntimeError(f"QRZ login HTTP {resp2.status_code}")
-        root = ET.fromstring(resp2.text)
-        session = find_first(root, "Session")
-        key_text = find_text(session, "Key") if session is not None else ""
-        if key_text:
-            return key_text
+        key = parse_session_key(resp2.text)
+        if key:
+            return key
     except Exception as e:
         if verbose:
             print("[qrz_login] fallback method failed:", e)
-    raise RuntimeError("QRZ login failed. Make sure your account has XML privileges (subscription) and credentials are correct.")
->>>>>>> refs/remotes/origin/main
+    raise RuntimeError(
+        "QRZ login failed. Make sure your account has XML privileges (subscription) and credentials are correct."
+    )
 
 def qrz_lookup_call(session_key, callsign, verbose=False):
     """
     Looks up a single callsign via QRZ XML API, returns dict or None.
     """
     params = {"s": session_key, "callsign": callsign}
-    resp = requests.get(QRZ_XML_BASE, params=params, headers={"User-Agent": "QRZ-Mapper/1.0"}, timeout=20)
+    resp = requests.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
     root = ET.fromstring(resp.text)
-<<<<<<< HEAD
-    call = root.find(".//call")
-    if call is None:
-        call = root.find(".//Callsign")
-    if call is None:
-        return None
-    def gt(elem, tag):
-        t = elem.find(tag)
-        return t.text.strip() if (t is not None and t.text) else ""
-=======
     # The QRZ xml returns <Callsign><addr>... etc. We'll try to extract name, address fields.
     call = find_first(root, "call", "Callsign")
     if call is None:
         return None
-    # Attempt to extract common fields
-    def get_text(elem, tag):
-        return find_text(elem, tag)
-    # Some tags: fname, name, addr1, addr2, city, state, postcode, country
->>>>>>> refs/remotes/origin/main
+
+    def get_text(tag):
+        return find_text(call, tag)
+
     data = {
-        "callsign": callsign,
-        "fname": gt(call, "fname") or gt(call, "name"),
-        "addr1": gt(call, "addr1"),
-        "addr2": gt(call, "addr2"),
-        "city": gt(call, "city"),
-        "state": gt(call, "state"),
-        "zipcode": gt(call, "zipcode") or gt(call, "postcode"),
-        "country": gt(call, "country"),
+        "callsign": get_text("call") or callsign,
+        "fname": get_text("fname") or get_text("name"),
+        "addr1": get_text("addr1"),
+        "addr2": get_text("addr2"),
+        "city": get_text("city"),
+        "state": get_text("state"),
+        "zipcode": get_text("zipcode") or get_text("postcode"),
+        "country": get_text("country"),
     }
     parts = [data.get("addr1"), data.get("addr2"), data.get("city"), data.get("state"), data.get("zipcode"), data.get("country")]
     addr = ", ".join([p for p in parts if p])
