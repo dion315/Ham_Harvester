@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Ham Harvester / QRZ Mapper — Guided Flow
+Ham Harvester / QRZ Mapper — Guided Flow (login-first, robust county loading)
 
 Flow:
-1) Modal login (QRZ XML API key or username/password).
+1) Modal login (QRZ XML API key OR username/password) before the main UI.
 2) Choose ONE mode:
    - Mode A: Pasted/CSV callsigns → enrich via QRZ → geocode → reverse-geocode county → grid
-   - Mode B: Harvest by selected counties in a state (FCC → QRZ → geocode → grid) 
+   - Mode B: Harvest by selected counties in a state (FCC → QRZ → geocode → grid)
    - Mode C: Harvest entire state (all counties)
 3) Export CSV (callsign, name, address, city, state, county, zip, grid, email, lat, lon)
 4) Export KML / HTML map
@@ -76,7 +76,7 @@ from geopy.geocoders import Nominatim as GeoNominatim  # optional; using direct 
 import simplekml
 
 # ---------- Globals ----------
-APP_AGENT = "HamHarvester/3.0"
+APP_AGENT = "HamHarvester/3.1"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_AGENT})
 
@@ -86,7 +86,7 @@ USER_AGENT = APP_AGENT
 # FCC constants
 FCC_BASE = "https://wireless2.fcc.gov/UlsApp/UlsSearch/searchGeographic.jsp"
 
-# Census datasets to try (any of these should return NAME for county geography)
+# Census datasets to try (any should return NAME for county geography)
 CENSUS_DATASETS = [
     ("PEP 2023",   "https://api.census.gov/data/2023/pep/population?get=NAME&for=county:*&in=state:{state_fips}"),
     ("ACS 2022",   "https://api.census.gov/data/2022/acs/acs5?get=NAME&for=county:*&in=state:{state_fips}"),
@@ -173,7 +173,6 @@ def reverse_geocode_nominatim(lat, lon, email="you@example.com", pause=1.0, verb
         if resp.status_code == 200:
             j = resp.json()
             addr = j.get("address", {})
-            # Nominatim county can be under 'county' or similar keys
             county = addr.get("county") or addr.get("state_district") or addr.get("region")
             time.sleep(pause)
             return county or ""
@@ -464,8 +463,7 @@ class CountyHarvestWorker(StoppableThread):
                     if self.session_key:
                         q = qrz_lookup_call(self.session_key, cs, verbose=self.verbose) or {}
                         rec.update(q)
-                    # ensure county is set (prefer known FCC county if reverse says otherwise)
-                    # Geocode & grid if possible
+                    # Geocode & grid
                     addr = rec.get("address") or ", ".join(
                         [rec.get("addr1", ""), rec.get("city", ""), rec.get("state", ""),
                          rec.get("zipcode", ""), rec.get("country", "")]
@@ -646,8 +644,9 @@ class App:
         self.worker = None
         self.queue = queue.Queue()
         self.records = []
+        self.early_logs = []     # <-- buffer logs before log_text exists
 
-        # --- Modal login first ---
+        # --- Modal login first (but buffer logs safely) ---
         self.prompt_login()
 
         # Main UI
@@ -741,6 +740,13 @@ class App:
         self.log_text = scrolledtext.ScrolledText(root, height=12, width=110)
         self.log_text.grid(row=2, column=0, sticky="nsew")
 
+        # Flush any early logs captured before log_text existed
+        if self.early_logs:
+            for line in self.early_logs:
+                self.log_text.insert("end", line + "\n")
+            self.log_text.see("end")
+            self.early_logs.clear()
+
         # Fill layout stretch
         root.rowconfigure(2, weight=1)
         root.columnconfigure(0, weight=1)
@@ -748,7 +754,7 @@ class App:
         self.update_mode_state()
         self.root.after(200, self.poll_queue)
 
-    # --- Login first ---
+    # --- Login first (now safe: buffers logs if log_text not ready) ---
     def prompt_login(self):
         dlg = LoginDialog(self.root)
         self.root.wait_window(dlg.top)
@@ -757,19 +763,29 @@ class App:
         api, u, p = dlg.result
         if api:
             self.session_key = api
-            self.log_direct("[info] Using provided QRZ session key")
+            self._buffer_or_print("[info] Using provided QRZ session key")
             return
         if not (u and p):
             messagebox.showerror("Login required", "You must provide an API key or username/password.")
             sys.exit(1)
-        self.log_direct(f"[info] Logging in to QRZ as {u} ...")
+        self._buffer_or_print(f"[info] Logging in to QRZ as {u} ...")
         try:
             sk = qrz_login(u, p, verbose=False)
             self.session_key = sk
-            self.log_direct("[info] QRZ session key obtained.")
+            self._buffer_or_print("[info] QRZ session key obtained.")
         except Exception as e:
             messagebox.showerror("QRZ Login Failed", str(e))
             sys.exit(1)
+
+    # --- Small helper to avoid touching log_text before it's created
+    def _buffer_or_print(self, line):
+        # If log_text exists, write; otherwise buffer and print to console
+        if hasattr(self, "log_text") and self.log_text:
+            self.log_text.insert("end", line + "\n")
+            self.log_text.see("end")
+        else:
+            self.early_logs.append(line)
+            print(line)
 
     # --- Mode management ---
     def update_mode_state(self):
@@ -791,17 +807,19 @@ class App:
                 child.configure(state="disabled")
 
     # --- UI helpers ---
-    def log_direct(self, line):
-        self.log_text.insert("end", line + "\n")
-        self.log_text.see("end")
-
     def log(self, msg, lvl="info"):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.log_text.insert("end", f"[{ts}] [{lvl}] {msg}\n")
-        self.log_text.see("end")
+        if hasattr(self, "log_text") and self.log_text:
+            self.log_text.insert("end", f"[{ts}] [{lvl}] {msg}\n")
+            self.log_text.see("end")
+        else:
+            self._buffer_or_print(f"[{ts}] [{lvl}] {msg}")
 
     def clear_log(self):
-        self.log_text.delete("1.0", "end")
+        if hasattr(self, "log_text") and self.log_text:
+            self.log_text.delete("1.0", "end")
+        else:
+            self.early_logs.clear()
 
     def browse_csv(self):
         p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
