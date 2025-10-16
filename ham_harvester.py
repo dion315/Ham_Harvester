@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Ham Harvester / QRZ Mapper — Guided Flow (v3.3)
+Ham Harvester / QRZ Mapper — Guided Flow (v3.4)
 
 Flow:
 1) Modal login (QRZ XML API key OR username/password) before the main UI.
 2) Choose ONE mode:
    - Mode A: Pasted/CSV callsigns → enrich via QRZ → geocode → reverse-geocode county → grid
-   - Mode B: Harvest by selected counties in a state (FCC → QRZ → geocode → grid)
+   - Mode B: Harvest by counties (state + multi-county) (FCC → QRZ → geocode → grid)
    - Mode C: Harvest entire state (all counties)
 3) Export CSV (callsign, name, address, city, state, county, zip, grid, email, lat, lon)
 4) Export KML / HTML map
 5) Verbose logging + progress + stop
+6) “Test FCC Query” button: test the current state + first selected county and log the first-page URL
+   and how many callsigns were detected there (without harvesting).
 
 Notes:
 - Email may be absent on QRZ depending on privacy settings.
@@ -76,7 +78,7 @@ from geopy.geocoders import Nominatim as GeoNominatim  # optional; using direct 
 import simplekml
 
 # ---------- Globals ----------
-APP_AGENT = "HamHarvester/3.3"
+APP_AGENT = "HamHarvester/3.4"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_AGENT})
 
@@ -387,7 +389,27 @@ def fetch_counties_for_state(state_abbr, log=None):
         return out
     return fetch_counties_from_fcc(state_abbr, log=log)
 
-# ---------- FCC ULS harvesting (scraper, paginated) ----------
+# ---------- FCC county normalization + scraping ----------
+FCC_COUNTY_SUFFIXES = [
+    " COUNTY", " PARISH", " BOROUGH", " CITY AND BOROUGH", " MUNICIPIO",
+    " CENSUS AREA", " INDEPENDENT CITY"
+]
+
+def normalize_county_for_fcc(name: str) -> str:
+    """Return a county string FCC search understands (e.g., 'MADISON' from 'Madison County')."""
+    if not name:
+        return ""
+    s = name.strip().upper()
+    # Remove parentheses, e.g. "Doña Ana County (Part)"
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", s)
+    for suf in FCC_COUNTY_SUFFIXES:
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+            break
+    s = re.sub(r"[^\w\s\-']", " ", s)     # keep letters/digits/space/hyphen/apostrophe
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbose=False, stopper=None):
     """
     Scrapes FCC ULS Geographic Search results for Amateur (HA/HV) Active licenses.
@@ -395,34 +417,87 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
     """
     calls = set()
     try:
+        # Warm session (cookies, etc.)
         HTTP.get(FCC_BASE, timeout=30)
 
-        payload = {
-            "state": state_abbr,
-            "county": county_name,
-            "servRadioServiceCode": "HA,HV",
-            "licStatus": "Active",
-            "ulsSearchType": "geographic",
-            "pageNumToReturn": "1",
-        }
-        resp = HTTP.post(FCC_BASE, data=payload, timeout=30)
-        if resp.status_code != 200:
-            raise RuntimeError(f"FCC search HTTP {resp.status_code}")
+        # Build county variants
+        c_full = (county_name or "").strip()
+        c_norm = normalize_county_for_fcc(c_full)
 
+        # Try both full + normalized names and a couple of param shapes
+        county_candidates = [c_full, c_norm]
+        county_candidates = [c for c in county_candidates if c]
+        seen = set()
+        county_candidates = [x for x in county_candidates if not (x in seen or seen.add(x))]
+
+        payload_variants = []
+        for c in county_candidates:
+            payload_variants.extend([
+                {
+                    "state": state_abbr,
+                    "county": c,
+                    "servRadioServiceCode": "HA,HV",
+                    "licStatus": "Active",
+                    "ulsSearchType": "geographic",
+                    "pageNumToReturn": "1",
+                },
+                {
+                    "state": state_abbr,
+                    "countyName": c,
+                    "servRadioServiceCode": "HA,HV",
+                    "licStatus": "Active",
+                    "ulsSearchType": "geographic",
+                    "pageNumToReturn": "1",
+                },
+            ])
+
+        resp = None
+
+        # Try payloads until the page looks like a results page
+        for pv in payload_variants:
+            if stopper and stopper.is_set():
+                break
+            if verbose:
+                print(f"[fcc] trying payload: {pv}")
+            r = HTTP.post(FCC_BASE, data=pv, timeout=30)
+            if r.status_code != 200:
+                if verbose:
+                    print(f"[fcc] HTTP {r.status_code} for variant")
+                continue
+            soup = BeautifulSoup(r.text, "html.parser")
+            has_table = bool(soup.find("table"))
+            has_license_links = bool(soup.select('a[href*="license"], a[href*="licKey"], a[href*="licId"]'))
+            has_next = any(re.search(r'^\s*next\b', (a.get_text() or ""), re.I) for a in soup.find_all("a"))
+            if has_table or has_license_links or has_next:
+                resp = r
+                break
+
+        if resp is None:
+            if verbose:
+                print(f"[fcc] no payload variant produced a recognizable results page for {county_name}, {state_abbr}")
+            return calls
+
+        # Page through results
         while True:
             if stopper and stopper.is_set():
                 break
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # Only anchors likely to be license detail links
+            # anchors to license detail pages
             anchors = soup.select('a[href*="license"], a[href*="licKey"], a[href*="licId"]')
             for a in anchors:
                 txt = (a.get_text() or "").strip().upper()
                 if is_callsign(txt):
                     calls.add(txt)
 
-            # Find "Next" link robustly
+            # table-cell fallback (in case link text changes)
+            for td in soup.find_all("td"):
+                t = (td.get_text() or "").strip().upper()
+                if 2 <= len(t) <= 10 and is_callsign(t):
+                    calls.add(t)
+
+            # Next page?
             next_link = None
             for a in soup.find_all("a"):
                 label = (a.get_text() or "").strip()
@@ -456,7 +531,7 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
 class StoppableThread(threading.Thread):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
-        self._stop_evt = threading.Event()   # renamed to avoid clashing with Thread._stop()
+        self._stop_evt = threading.Event()   # avoid clashing with Thread._stop()
         self.daemon = True
     def stop(self): self._stop_evt.set()
     def stopped(self): return self._stop_evt.is_set()
@@ -483,19 +558,23 @@ class CountyHarvestWorker(StoppableThread):
 
         for county in self.counties:
             if self.stopped(): break
+            norm = normalize_county_for_fcc(county)
+            if norm and norm != county:
+                self.out_q.put(("log", f"FCC: searching {county} (normalized → {norm}), {self.state_abbr} ..."))
+            else:
+                self.out_q.put(("log", f"FCC: searching {county}, {self.state_abbr} ..."))
             if self.polite:
                 time.sleep(0.8)
-            self.out_q.put(("log", f"FCC: searching {county}, {self.state_abbr} ..."))
 
             calls = fcc_search_active_callsigns(
                 self.state_abbr, county,
                 polite_sleep=1.0 if self.polite else 0.2,
                 verbose=self.verbose,
-                stopper=self._stop_evt  # pass our event safely
+                stopper=self._stop_evt
             )
 
             if not calls:
-                self.out_q.put(("log", f"No calls returned for {county}. If persistent, try removing 'County' suffix or verify on FCC.",))
+                self.out_q.put(("log", f"No calls returned for {county}. If persistent, try verifying on FCC or adjust county name.",))
             # Enrich each call
             for idx, cs in enumerate(sorted(calls), 1):
                 if self.stopped(): break
@@ -706,7 +785,7 @@ class App:
         # Mode choice
         self.mode = tk.StringVar(value="calls")
         mode_box = ttk.LabelFrame(frm, text="Mode")
-        mode_box.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0,8))
+        mode_box.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0,8))
 
         ttk.Radiobutton(mode_box, text="A) Lookup pasted/CSV callsigns", variable=self.mode, value="calls",
                         command=self.update_mode_state).grid(row=0, column=0, sticky="w")
@@ -717,7 +796,7 @@ class App:
 
         # Callsigns inputs (Mode A)
         calls_frame = ttk.LabelFrame(frm, text="Callsigns")
-        calls_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0,8))
+        calls_frame.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(0,8))
         self.calls_frame = calls_frame
 
         ttk.Label(calls_frame, text="CSV of callsigns (optional):").grid(row=0, column=0, sticky="w")
@@ -731,7 +810,7 @@ class App:
 
         # State/County inputs (Modes B & C)
         geo_frame = ttk.LabelFrame(frm, text="Geography")
-        geo_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0,8))
+        geo_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(0,8))
         self.geo_frame = geo_frame
 
         ttk.Label(geo_frame, text="State:").grid(row=0, column=0, sticky="w")
@@ -746,9 +825,14 @@ class App:
         self.county_list = tk.Listbox(geo_frame, selectmode="extended", width=40, height=7, exportselection=False)
         self.county_list.grid(row=0, column=3, sticky="w")
 
+        # --- NEW: Test FCC Query button ---
+        test_row = ttk.Frame(geo_frame)
+        test_row.grid(row=1, column=0, columnspan=4, sticky="w", pady=(6,0))
+        ttk.Button(test_row, text="Test FCC Query (first selected county)", command=self.test_fcc_query).grid(row=0, column=0, padx=(0,8))
+
         # Geocoding settings
         geocode_frame = ttk.LabelFrame(frm, text="Geocoding")
-        geocode_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0,8))
+        geocode_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(0,8))
         ttk.Label(geocode_frame, text="Mode:").grid(row=0, column=0, sticky="w")
         self.gc_mode = tk.StringVar(value="nominatim")
         ttk.Radiobutton(geocode_frame, text="OpenStreetMap (no API key)", variable=self.gc_mode, value="nominatim").grid(row=0, column=1, sticky="w")
@@ -764,14 +848,14 @@ class App:
 
         # Options + buttons
         opts = ttk.Frame(frm)
-        opts.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0,8))
+        opts.grid(row=4, column=0, columnspan=4, sticky="ew", pady=(0,8))
         self.verbose = tk.BooleanVar(value=False)
         self.polite = tk.BooleanVar(value=True)
         ttk.Checkbutton(opts, text="Verbose output", variable=self.verbose).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(opts, text="Polite mode (slow & gentle)", variable=self.polite).grid(row=0, column=1, sticky="w", padx=12)
 
         bfrm = ttk.Frame(frm)
-        bfrm.grid(row=5, column=0, columnspan=3, sticky="we")
+        bfrm.grid(row=5, column=0, columnspan=4, sticky="we")
         ttk.Button(bfrm, text="Run", command=self.run_action).grid(row=0, column=0, sticky="we", padx=2)
         ttk.Button(bfrm, text="Stop", command=self.stop).grid(row=0, column=1, sticky="we", padx=2)
         ttk.Button(bfrm, text="Export CSV", command=self.export_csv).grid(row=0, column=2, sticky="we", padx=2)
@@ -780,14 +864,14 @@ class App:
         ttk.Button(bfrm, text="Clear Log", command=self.clear_log).grid(row=0, column=5, sticky="we", padx=2)
 
         # Progress + status
-        self.progress = ttk.Progressbar(frm, orient="horizontal", length=480, mode="determinate")
-        self.progress.grid(row=6, column=0, columnspan=2, sticky="w", pady=(6,0))
+        self.progress = ttk.Progressbar(frm, orient="horizontal", length=520, mode="determinate")
+        self.progress.grid(row=6, column=0, columnspan=3, sticky="w", pady=(6,0))
         self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=6, column=2, sticky="w", pady=(6,0))
+        ttk.Label(frm, textvariable=self.status_var).grid(row=6, column=3, sticky="w", pady=(6,0))
 
         # Log
         ttk.Label(root, text="Log / Output:").grid(row=1, column=0, sticky="w")
-        self.log_text = scrolledtext.ScrolledText(root, height=12, width=110)
+        self.log_text = scrolledtext.ScrolledText(root, height=12, width=115)
         self.log_text.grid(row=2, column=0, sticky="nsew")
 
         # Flush any early logs captured before log_text existed
@@ -922,6 +1006,92 @@ class App:
     def get_selected_counties(self):
         idxs = self.county_list.curselection()
         return [self.county_list.get(i) for i in idxs]
+
+    # --- NEW: Test FCC Query (no harvesting) ---
+    def test_fcc_query(self):
+        if self.mode.get() == "calls":
+            messagebox.showinfo("Test FCC Query", "Switch to 'Harvest by counties' or 'Entire state' to test.")
+            return
+        st = (self.state_var.get() or "").strip().upper()
+        if not st:
+            messagebox.showinfo("Select State", "Pick a state first")
+            return
+        sel = self.get_selected_counties()
+        if not sel:
+            messagebox.showinfo("Select County", "Select at least one county to test")
+            return
+        county = sel[0]
+        norm = normalize_county_for_fcc(county)
+        if norm and norm != county:
+            self.log(f"Test FCC: {county} (normalized → {norm}), {st}", "info")
+        else:
+            self.log(f"Test FCC: {county}, {st}", "info")
+
+        try:
+            # Warm-up GET
+            HTTP.get(FCC_BASE, timeout=30)
+
+            cands = [county, norm] if norm else [county]
+            # dedupe but keep order
+            seen = set()
+            cands = [x for x in cands if not (x in seen or seen.add(x))]
+
+            payloads = []
+            for c in cands:
+                payloads.extend([
+                    {
+                        "state": st, "county": c, "servRadioServiceCode": "HA,HV",
+                        "licStatus": "Active", "ulsSearchType": "geographic", "pageNumToReturn": "1",
+                    },
+                    {
+                        "state": st, "countyName": c, "servRadioServiceCode": "HA,HV",
+                        "licStatus": "Active", "ulsSearchType": "geographic", "pageNumToReturn": "1",
+                    },
+                ])
+
+            working = None
+            resp = None
+
+            for pv in payloads:
+                r = HTTP.post(FCC_BASE, data=pv, timeout=30)
+                if r.status_code != 200:
+                    self.log(f"Test FCC: HTTP {r.status_code} for payload {pv}", "error")
+                    continue
+                soup = BeautifulSoup(r.text, "html.parser")
+                has_table = bool(soup.find("table"))
+                has_license_links = bool(soup.select('a[href*="license"], a[href*="licKey"], a[href*="licId"]'))
+                has_next = any(re.search(r'^\s*next\b', (a.get_text() or ""), re.I) for a in soup.find_all("a"))
+                if has_table or has_license_links or has_next:
+                    working = pv
+                    resp = r
+                    break
+
+            if resp is None:
+                self.log("Test FCC: no payload variant produced a recognizable results page.", "error")
+                return
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+
+            # Count calls on first page
+            calls_first = set()
+            for a in soup.select('a[href*="license"], a[href*="licKey"], a[href*="licId"]'):
+                t = (a.get_text() or "").strip().upper()
+                if is_callsign(t): calls_first.add(t)
+            for td in soup.find_all("td"):
+                t = (td.get_text() or "").strip().upper()
+                if 2 <= len(t) <= 10 and is_callsign(t): calls_first.add(t)
+
+            has_next = any(re.search(r'^\s*next\b', (a.get_text() or ""), re.I) for a in soup.find_all("a"))
+
+            self.log(f"Test FCC: first-page URL: {resp.url}", "info")
+            self.log(f"Test FCC: payload used: {working}", "info")
+            self.log(f"Test FCC: calls on page 1 → {len(calls_first)} (pagination: {'yes' if has_next else 'no'})", "info")
+            if calls_first:
+                sample = ", ".join(sorted(list(calls_first))[:25])
+                self.log(f"Test FCC: sample → {sample}", "info")
+
+        except Exception as e:
+            self.log(f"Test FCC error: {e}", "error")
 
     # --- Actions ---
     def run_action(self):
