@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>html,body,#map{height:100%;margin:0;padding:0}</style></head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+var map = L.map('map');
+var bounds = L.latLngBounds([[43.0389539, -75.8660299], [43.0389539, -75.8660299]]);
+map.fitBounds(bounds);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '© OpenStreetMap contributors'
+}).addTo(map);
+L.marker([43.0389539, -75.8660299]).addTo(map).bindPopup("N2SEC<br/>311 FALLS BLVD, CHITTENANGO, NY, United States");
+</script></body></html>
