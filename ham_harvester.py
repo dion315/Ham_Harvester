@@ -81,6 +81,28 @@ def geocode_google(address, api_key, verbose=False):
     loc = j["results"][0]["geometry"]["location"]
     return loc["lat"], loc["lng"]
 
+# Simple XML helper that ignores namespaces when searching for tags.
+def find_first(elem, *tag_names):
+    """Return the first descendant whose local-name matches any of ``tag_names``."""
+    if elem is None:
+        return None
+    wanted = {name.lower() for name in tag_names}
+    for node in elem.iter():
+        local = node.tag.split('}', 1)[-1].lower()
+        if local in wanted:
+            return node
+    return None
+
+
+def find_text(elem, *tag_names):
+    if elem is None:
+        return ""
+    node = find_first(elem, *tag_names)
+    if node is not None and node.text:
+        return node.text.strip()
+    return ""
+
+
 # QRZ XML API: login to get session key
 def qrz_login(username, password, verbose=False):
     """
@@ -100,9 +122,10 @@ def qrz_login(username, password, verbose=False):
         if resp.status_code != 200:
             raise RuntimeError(f"QRZ login HTTP {resp.status_code}")
         root = ET.fromstring(resp.text)
-        session = root.find(".//Session")
-        if session is not None and session.text:
-            key = session.text.strip()
+        session = find_first(root, "Session")
+        key_text = find_text(session, "Key") if session is not None else ""
+        if key_text:
+            key = key_text
             if verbose:
                 print("[qrz_login] obtained session key")
             return key
@@ -113,10 +136,13 @@ def qrz_login(username, password, verbose=False):
     try:
         params = {"username": username, "password": password}
         resp2 = requests.get(QRZ_XML_LOGIN_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
+        if resp2.status_code != 200:
+            raise RuntimeError(f"QRZ login HTTP {resp2.status_code}")
         root = ET.fromstring(resp2.text)
-        session = root.find(".//Session")
-        if session is not None and session.text:
-            return session.text.strip()
+        session = find_first(root, "Session")
+        key_text = find_text(session, "Key") if session is not None else ""
+        if key_text:
+            return key_text
     except Exception as e:
         if verbose:
             print("[qrz_login] fallback method failed:", e)
@@ -132,16 +158,12 @@ def qrz_callsign_lookup(session_key, callsign, verbose=False):
         raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
     root = ET.fromstring(resp.text)
     # The QRZ xml returns <Callsign><addr>... etc. We'll try to extract name, address fields.
-    call = root.find(".//call")
-    if call is None:
-        # Some XML variants use <Callsign> element
-        call = root.find(".//Callsign")
+    call = find_first(root, "call", "Callsign")
     if call is None:
         return None
     # Attempt to extract common fields
     def get_text(elem, tag):
-        t = elem.find(tag)
-        return t.text.strip() if t is not None and t.text else ""
+        return find_text(elem, tag)
     # Some tags: fname, name, addr1, addr2, city, state, postcode, country
     data = {
         "callsign": callsign,
@@ -267,8 +289,13 @@ class QRZMapperApp:
         self.google_key = tk.StringVar()
         ttk.Entry(frm, textvariable=self.google_key, width=60).grid(row=7, column=1, columnspan=2, sticky="w")
 
-        ttk.Checkbutton(frm, text="Verbose output", command=self.toggle_verbose).grid(row=8, column=0, sticky="w")
         self.verbose = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm,
+            text="Verbose output",
+            variable=self.verbose,
+            command=self.toggle_verbose,
+        ).grid(row=8, column=0, sticky="w")
 
         # Progress and controls
         ttk.Separator(frm, orient="horizontal").grid(row=9, column=0, columnspan=3, sticky="ew", pady=6)
@@ -301,7 +328,8 @@ class QRZMapperApp:
         self.root.after(200, self.poll_queue)
 
     def toggle_verbose(self):
-        self.verbose.set(not self.verbose.get())
+        state = "enabled" if self.verbose.get() else "disabled"
+        self.log(f"Verbose output {state}", lvl="info")
 
     def browse_csv(self):
         p = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
