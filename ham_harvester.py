@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-QRZ County / Callsign Mapper (State/County Harvester + GUI, Census API county list)
+QRZ County / Callsign Mapper (Resilient County Loader: Census multi-source + FCC fallback)
 
 - State dropdown + county multi-select.
-- Counties are fetched on demand from the Census API using an embedded state→FIPS map.
+- Counties fetched on-demand using multiple Census datasets with FCC page fallback.
 - "Harvest FCC by County":
     * Queries FCC ULS Geographic Search for Amateur (HA/HV) Active licenses.
     * Extracts callsigns, enriches via QRZ XML (name, address, email).
@@ -72,11 +72,11 @@ ensure_deps(verbose=True)
 import requests
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
-from geopy.geocoders import Nominatim as GeoNominatim  # not strictly required, but available
+from geopy.geocoders import Nominatim as GeoNominatim  # optional
 import simplekml
 
 # ---------- Globals ----------
-APP_AGENT = "QRZ-Mapper/2.2"
+APP_AGENT = "QRZ-Mapper/2.3"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_AGENT})
 QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
@@ -85,8 +85,13 @@ USER_AGENT = APP_AGENT
 # FCC constants
 FCC_BASE = "https://wireless2.fcc.gov/UlsApp/UlsSearch/searchGeographic.jsp"
 
-# Census counties API (we’ll request: get=NAME&for=county:*&in=state:XX)
-CENSUS_API_TEMPLATE = "https://api.census.gov/data/2023/pep/population?get=NAME&for=county:*&in=state:{state_fips}"
+# Census datasets to try (any of these should return NAME for county geography)
+CENSUS_DATASETS = [
+    # (label, template_url)
+    ("PEP 2023",   "https://api.census.gov/data/2023/pep/population?get=NAME&for=county:*&in=state:{state_fips}"),
+    ("ACS 2022",   "https://api.census.gov/data/2022/acs/acs5?get=NAME&for=county:*&in=state:{state_fips}"),
+    ("DEC 2020",   "https://api.census.gov/data/2020/dec/pl?get=NAME&for=county:*&in=state:{state_fips}"),
+]
 
 # Embedded USPS → FIPS (50 states + DC + PR)
 STATE_ABBR_TO_FIPS = {
@@ -269,33 +274,89 @@ def qrz_lookup_call(session_key, callsign, verbose=False):
         print(f"[qrz_lookup_call] {callsign} -> {data['address']}")
     return data
 
-# --- County list via Census API ---
-def fetch_counties_for_state(state_abbr):
+# --- County list loaders ---
+def fetch_counties_from_census(state_abbr, log=None):
     """
-    Fetch counties for a given USPS state abbreviation using the Census API.
-    Returns a sorted list of county names like "Albany County", "Kings County", etc.
+    Try multiple Census datasets for county names for a state.
+    Returns list of "X County"/"X Parish"/etc, or [] on failure.
     """
     st = (state_abbr or "").strip().upper()
     fips = STATE_ABBR_TO_FIPS.get(st)
     if not fips:
+        if log: log(f"State '{st}' not in FIPS map.", "error")
         return []
-    url = CENSUS_API_TEMPLATE.format(state_fips=fips)
-    r = HTTP.get(url, timeout=20)
-    if r.status_code != 200:
-        return []
+
+    for label, template in CENSUS_DATASETS:
+        url = template.format(state_fips=fips)
+        try:
+            r = HTTP.get(url, timeout=20)
+            if r.status_code != 200:
+                if log: log(f"Census {label} HTTP {r.status_code}", "error")
+                continue
+            data = r.json()
+            out = []
+            for row in data[1:]:
+                name = row[0]  # e.g., "Albany County, New York"
+                if "," in name:
+                    name = name.split(",", 1)[0].strip()
+                out.append(name)
+            out = sorted(set(out))
+            if out:
+                if log: log(f"Census source OK: {label} ({len(out)} counties)", "info")
+                return out
+        except Exception as e:
+            if log: log(f"Census {label} error: {e}", "error")
+
+    return []
+
+def fetch_counties_from_fcc(state_abbr, log=None):
+    """
+    Fallback: load FCC page and parse the county <select> options for a state.
+    """
+    st = (state_abbr or "").strip().upper()
     try:
-        data = r.json()
-        # data[0] is header, rows like ["Albany County, New York","36","001"]
-        out = []
-        for row in data[1:]:
-            name = row[0]  # "Albany County, New York"
-            # Strip ", State Name"
-            if "," in name:
-                name = name.split(",", 1)[0].strip()
-            out.append(name)
-        return sorted(set(out))
-    except Exception:
+        # Load page with state param to get its county select populated (server-side).
+        params = {"state": st}
+        r = HTTP.get(FCC_BASE, params=params, timeout=30)
+        if r.status_code != 200:
+            if log: log(f"FCC county list HTTP {r.status_code}", "error")
+            return []
+        soup = BeautifulSoup(r.text, "html.parser")
+        # Look for a select element that likely represents counties
+        cand = soup.find("select", attrs={"name": re.compile("county", re.I)})
+        if not cand:
+            # fallback: any select with many options containing 'County'
+            selects = soup.find_all("select")
+            for s in selects:
+                opts = s.find_all("option")
+                if sum(1 for o in opts if "county" in (o.text or "").lower()) > 5:
+                    cand = s
+                    break
+        if not cand:
+            if log: log("FCC county select not found.", "error")
+            return []
+        names = []
+        for opt in cand.find_all("option"):
+            txt = (opt.text or "").strip()
+            if not txt or txt.lower().startswith(("select", "all ")):
+                continue
+            names.append(txt)
+        out = sorted(set(names))
+        if out and log:
+            log(f"FCC fallback OK ({len(out)} counties)", "info")
+        return out
+    except Exception as e:
+        if log: log(f"FCC fallback error: {e}", "error")
         return []
+
+def fetch_counties_for_state(state_abbr, log=None):
+    """
+    Unified county fetcher with multiple sources + fallback.
+    """
+    out = fetch_counties_from_census(state_abbr, log=log)
+    if out:
+        return out
+    return fetch_counties_from_fcc(state_abbr, log=log)
 
 # --- FCC ULS harvesting (scraper) ---
 CALL_RE = re.compile(r"^[A-Z0-9/]{3,}$")
@@ -310,7 +371,6 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
         # Start session (some pages require it)
         HTTP.get(FCC_BASE, timeout=30)
 
-        # FCC is picky about county text — we try the plain county name first.
         payload = {
             "state": state_abbr,
             "county": county_name,              # e.g., "Albany County"
@@ -378,7 +438,7 @@ class CountyHarvestWorker(threading.Thread):
                 verbose=self.verbose
             )
             if not cs:
-                self.out_q.put(("log", f"No calls returned for {county} — if persistent, try a neighboring county name variant (e.g., no 'County' suffix)."))
+                self.out_q.put(("log", f"No calls returned for {county} — if persistent, try without 'County' suffix or verify on FCC site."))  # hint
             all_calls.update(cs)
             self.out_q.put(("progress", {
                 "processed": i, "total": len(self.counties),
@@ -568,7 +628,7 @@ class App:
         if not st or st not in STATE_ABBR_TO_FIPS:
             return
         self.log(f"Loading counties for {st} ...", "info")
-        counties = fetch_counties_for_state(st)
+        counties = fetch_counties_for_state(st, log=self.log)
         if not counties:
             self.log(f"Could not load counties for {st}. Check network or try again.", "error")
             return
