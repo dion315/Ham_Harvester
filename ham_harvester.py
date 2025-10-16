@@ -132,15 +132,42 @@ def geocode_google(address, api_key, verbose=False):
     loc = j["results"][0]["geometry"]["location"]
     return loc["lat"], loc["lng"]
 
+<<<<<<< HEAD
 # ---------- QRZ XML API logic ----------
 
 QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
 
+=======
+# Simple XML helper that ignores namespaces when searching for tags.
+def find_first(elem, *tag_names):
+    """Return the first descendant whose local-name matches any of ``tag_names``."""
+    if elem is None:
+        return None
+    wanted = {name.lower() for name in tag_names}
+    for node in elem.iter():
+        local = node.tag.split('}', 1)[-1].lower()
+        if local in wanted:
+            return node
+    return None
+
+
+def find_text(elem, *tag_names):
+    if elem is None:
+        return ""
+    node = find_first(elem, *tag_names)
+    if node is not None and node.text:
+        return node.text.strip()
+    return ""
+
+
+# QRZ XML API: login to get session key
+>>>>>>> refs/remotes/origin/main
 def qrz_login(username, password, verbose=False):
     """
     Logs into QRZ XML API using username/password, returns session key.
     """
     if verbose:
+<<<<<<< HEAD
         print("[qrz_login] attempting via XML POST")
     # XML payload
     payload = f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD></QRZDatabase>"
@@ -164,6 +191,44 @@ def qrz_login(username, password, verbose=False):
     if session2 is not None and session2.text:
         return session2.text.strip()
     raise RuntimeError("QRZ login failed; check credentials and XML privileges")
+=======
+        print("[qrz_login] attempting login")
+    # QRZ XML login is performed by POSTing an XML request to the XML endpoint and parsing.
+    # The simple documented approach: use requests.post to QRZ_XML_LOGIN_URL with data containing username/password.
+    # Some users place credentials as URL params; implement both fallback approaches.
+    try:
+        # First try the documented XML login POST
+        xml_payload = f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD><OPTIONS><keeplogin>1</keeplogin></OPTIONS></QRZDatabase>"
+        resp = requests.post(QRZ_XML_LOGIN_URL, data=xml_payload, headers={"Content-Type": "application/xml", "User-Agent": USER_AGENT}, timeout=20)
+        if resp.status_code != 200:
+            raise RuntimeError(f"QRZ login HTTP {resp.status_code}")
+        root = ET.fromstring(resp.text)
+        session = find_first(root, "Session")
+        key_text = find_text(session, "Key") if session is not None else ""
+        if key_text:
+            key = key_text
+            if verbose:
+                print("[qrz_login] obtained session key")
+            return key
+    except Exception as e:
+        if verbose:
+            print("[qrz_login] xml-post method failed:", e)
+    # Fallback: try GET style (older installations used query params)
+    try:
+        params = {"username": username, "password": password}
+        resp2 = requests.get(QRZ_XML_LOGIN_URL, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
+        if resp2.status_code != 200:
+            raise RuntimeError(f"QRZ login HTTP {resp2.status_code}")
+        root = ET.fromstring(resp2.text)
+        session = find_first(root, "Session")
+        key_text = find_text(session, "Key") if session is not None else ""
+        if key_text:
+            return key_text
+    except Exception as e:
+        if verbose:
+            print("[qrz_login] fallback method failed:", e)
+    raise RuntimeError("QRZ login failed. Make sure your account has XML privileges (subscription) and credentials are correct.")
+>>>>>>> refs/remotes/origin/main
 
 def qrz_lookup_call(session_key, callsign, verbose=False):
     """
@@ -174,6 +239,7 @@ def qrz_lookup_call(session_key, callsign, verbose=False):
     if resp.status_code != 200:
         raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
     root = ET.fromstring(resp.text)
+<<<<<<< HEAD
     call = root.find(".//call")
     if call is None:
         call = root.find(".//Callsign")
@@ -182,6 +248,16 @@ def qrz_lookup_call(session_key, callsign, verbose=False):
     def gt(elem, tag):
         t = elem.find(tag)
         return t.text.strip() if (t is not None and t.text) else ""
+=======
+    # The QRZ xml returns <Callsign><addr>... etc. We'll try to extract name, address fields.
+    call = find_first(root, "call", "Callsign")
+    if call is None:
+        return None
+    # Attempt to extract common fields
+    def get_text(elem, tag):
+        return find_text(elem, tag)
+    # Some tags: fname, name, addr1, addr2, city, state, postcode, country
+>>>>>>> refs/remotes/origin/main
     data = {
         "callsign": callsign,
         "fname": gt(call, "fname") or gt(call, "name"),
@@ -308,8 +384,13 @@ class App:
         self.google_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.google_var, width=60).grid(row=7, column=1, columnspan=2)
 
-        ttk.Checkbutton(frm, text="Verbose output", command=self.toggle_verbose).grid(row=8, column=0, sticky="w")
         self.verbose = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm,
+            text="Verbose output",
+            variable=self.verbose,
+            command=self.toggle_verbose,
+        ).grid(row=8, column=0, sticky="w")
 
         # Progress bar and controls
         ttk.Separator(frm, orient="horizontal").grid(row=9, column=0, columnspan=3, sticky="ew", pady=6)
@@ -341,7 +422,8 @@ class App:
         self.root.after(200, self.poll_queue)
 
     def toggle_verbose(self):
-        self.verbose.set(not self.verbose.get())
+        state = "enabled" if self.verbose.get() else "disabled"
+        self.log(f"Verbose output {state}", lvl="info")
 
     def browse_csv(self):
         p = filedialog.askopenfilename(filetypes=[("CSV","*.csv"), ("All files","*.*")])
