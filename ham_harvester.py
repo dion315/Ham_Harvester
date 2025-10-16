@@ -456,10 +456,10 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
 class StoppableThread(threading.Thread):
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
-        self._stop = threading.Event()
+        self._stop_evt = threading.Event()   # renamed to avoid clashing with Thread._stop()
         self.daemon = True
-    def stop(self): self._stop.set()
-    def stopped(self): return self._stop.is_set()
+    def stop(self): self._stop_evt.set()
+    def stopped(self): return self._stop_evt.is_set()
 
 class CountyHarvestWorker(StoppableThread):
     def __init__(self, state_abbr, counties, session_key, geocode_mode, google_key,
@@ -491,7 +491,7 @@ class CountyHarvestWorker(StoppableThread):
                 self.state_abbr, county,
                 polite_sleep=1.0 if self.polite else 0.2,
                 verbose=self.verbose,
-                stopper=self._stop
+                stopper=self._stop_evt  # pass our event safely
             )
 
             if not calls:
@@ -694,7 +694,7 @@ class App:
         self.worker = None
         self.queue = queue.Queue()
         self.records = []
-        self.early_logs = []     # buffer logs before log_text exists
+        self.early_logs = []     # buffer logs before log widget exists
 
         # --- Modal login first (but buffer logs safely) ---
         self.prompt_login()
