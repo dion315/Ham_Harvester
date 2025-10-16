@@ -2,15 +2,28 @@
 """
 QRZ County / Callsign Mapper (GUI + Dependency Auto-Install + API Key Option)
 
-- Verifies and installs missing dependencies at runtime.
+- Verifies and installs missing dependencies at runtime (except tkinter).
 - Supports providing a QRZ XML API session key directly (if you already have it).
 - GUI for callsign lookup, geocoding, progress/ETA display.
 - Export to CSV, KML, HTML map (Google Maps or Leaflet fallback).
+- Nominatim usage made policy-friendly (contact email, backoff).
 """
 
 import sys
 import subprocess
 import importlib
+
+# ---- Ensure tkinter is present first; it's provided by the OS, not pip ----
+try:
+    import tkinter as tk  # noqa
+    from tkinter import ttk, filedialog, messagebox, scrolledtext
+except Exception:
+    print("[ERROR] tkinter is not available.\n"
+          "On Debian/Ubuntu: sudo apt-get install python3-tk\n"
+          "On Fedora: sudo dnf install python3-tkinter\n"
+          "On Windows/macOS: install standard Python from python.org (tkinter included).")
+    sys.exit(1)
+
 
 def check_and_install_dependencies(verbose=False):
     """
@@ -19,19 +32,14 @@ def check_and_install_dependencies(verbose=False):
     """
     required = [
         "requests",
-        "tkinter",       # for GUI
-        "geojson",       # optional if you want geojson export later (not mandatory)
         "simplekml",
-        # not strictly needed but commonly used in mapping
         "pandas",
         "geopy",
     ]
     missing = []
     for pkg in required:
-        # For tkinter, the module name is "tkinter" in Python 3
-        modname = pkg
         try:
-            importlib.import_module(modname)
+            importlib.import_module(pkg)
             if verbose:
                 print(f"[OK] {pkg} importable")
         except ImportError:
@@ -44,49 +52,46 @@ def check_and_install_dependencies(verbose=False):
     print(f"[INFO] Missing packages: {missing}")
     print("[INFO] Attempting to install missing packages via pip...")
     for pkg in missing:
-        # For "tkinter" on some systems, pip package might be "tk" or the system might not allow installing
-        pip_name = pkg
-        if pkg == "tkinter":
-            pip_name = "tk"  # try installing package "tk"
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
             if verbose:
-                print(f"[INSTALLED] {pip_name}")
+                print(f"[INSTALLED] {pkg}")
         except Exception as e:
-            print(f"[ERROR] Could not install {pip_name}: {e}")
+            print(f"[ERROR] Could not install {pkg}: {e}")
             print("Please install missing dependency manually and re-run.")
             sys.exit(1)
     print("[INFO] All missing dependencies installed.")
     return True
 
+
 # Run dependency check early
 check_and_install_dependencies(verbose=True)
 
-# Now import the modules needed
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+# ---- Standard libs & deps (safe to import now) ----
 import threading
 import queue
 import time
 import csv
+import json
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
-
-# Optionally import geocoding packages if installed
-# We'll fallback to our custom simple geocode routines if not
-try:
-    from geopy.geocoders import Nominatim as GeoNominatim
-    GEO_AVAILABLE = True
-except ImportError:
-    GEO_AVAILABLE = False
-
+import re
 import simplekml
 
-# ---------- Utility functions ----------
+# ---------- Globals / HTTP session ----------
+QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
+QRZ_XML_LOGIN_URL = QRZ_XML_BASE
+USER_AGENT = "QRZ-Mapper/1.0"
 
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": USER_AGENT})
+
+
+# ---------- Utility functions ----------
 def now_ts():
     return time.time()
+
 
 def nice_elapsed(seconds):
     if seconds < 60:
@@ -99,23 +104,34 @@ def nice_elapsed(seconds):
         return f"{m}m {s}s"
     return f"{s}s"
 
-# Basic geocode by OpenStreetMap Nominatim (no third-party library)
-def geocode_nominatim(address, pause=1.0, verbose=False):
+
+# Basic geocode by OpenStreetMap Nominatim (policy-friendly)
+def geocode_nominatim(address, email="you@example.com", pause=1.0, verbose=False):
     url = "https://nominatim.openstreetmap.org/search"
-    headers = {"User-Agent": "QRZ-Mapper/1.0 (example@example.com)"}
-    params = {"q": address, "format": "json", "limit": 1}
-    if verbose:
-        print(f"[geocode_nominatim] querying: {address}")
-    resp = requests.get(url, params=params, headers=headers, timeout=20)
-    time.sleep(pause)
-    if resp.status_code != 200:
+    headers = {"User-Agent": f"{USER_AGENT} ({email})"}
+    params = {"q": address, "format": "json", "limit": 1, "email": email}
+    # retry with backoff for 429/503
+    for attempt in range(3):
+        if verbose:
+            print(f"[geocode_nominatim] querying: {address} (try {attempt+1})")
+        resp = HTTP.get(url, params=params, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            arr = resp.json()
+            if arr:
+                lat = float(arr[0]["lat"])
+                lon = float(arr[0]["lon"])
+                # polite pacing
+                time.sleep(pause)
+                return lat, lon
+            time.sleep(pause)
+            return None
+        if resp.status_code in (429, 503):
+            # exponential backoff
+            time.sleep(pause * (2 ** attempt))
+            continue
         raise RuntimeError(f"Nominatim HTTP {resp.status_code}")
-    arr = resp.json()
-    if not arr:
-        return None
-    lat = float(arr[0]["lat"])
-    lon = float(arr[0]["lon"])
-    return (lat, lon)
+    return None
+
 
 # Google geocoding
 def geocode_google(address, api_key, verbose=False):
@@ -123,23 +139,18 @@ def geocode_google(address, api_key, verbose=False):
     params = {"address": address, "key": api_key}
     if verbose:
         print(f"[geocode_google] querying: {address}")
-    resp = requests.get(url, params=params, timeout=20)
+    resp = HTTP.get(url, params=params, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"Google geocode HTTP {resp.status_code}")
     j = resp.json()
-    if j.get("status") != "OK":
-        return None
+    status = j.get("status", "UNKNOWN")
+    if status != "OK":
+        return None, status
     loc = j["results"][0]["geometry"]["location"]
-    return loc["lat"], loc["lng"]
-
-# ---------- QRZ XML API logic ----------
-
-QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
-QRZ_XML_LOGIN_URL = QRZ_XML_BASE
-USER_AGENT = "QRZ-Mapper/1.0"
+    return (loc["lat"], loc["lng"]), "OK"
 
 
-# Simple XML helper that ignores namespaces when searching for tags.
+# ---------- XML helpers (namespace-agnostic) ----------
 def find_first(elem, *tag_names):
     """Return the first descendant whose local-name matches any of ``tag_names``."""
     if elem is None:
@@ -161,13 +172,13 @@ def find_text(elem, *tag_names):
     return ""
 
 
-# QRZ XML API: login to get session key
+# ---------- QRZ XML API logic ----------
 def qrz_login(username, password, verbose=False):
     """
     Logs into QRZ XML API using username/password, returns session key.
     """
     if verbose:
-        print("[qrz_login] attempting login")
+        print("[qrz_login] attempting login")  # do not print creds
 
     def parse_session_key(xml_text):
         root = ET.fromstring(xml_text)
@@ -177,14 +188,13 @@ def qrz_login(username, password, verbose=False):
             key = session.text.strip()
         return key
 
-    # QRZ XML login is performed by POSTing an XML request to the XML endpoint and parsing.
-    # Some users place credentials as URL params; implement both fallback approaches.
+    # Primary: POST XML
     try:
         xml_payload = (
             f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD>"
             "<OPTIONS><keeplogin>1</keeplogin></OPTIONS></QRZDatabase>"
         )
-        resp = requests.post(
+        resp = HTTP.post(
             QRZ_XML_LOGIN_URL,
             data=xml_payload,
             headers={"Content-Type": "application/xml", "User-Agent": USER_AGENT},
@@ -201,10 +211,10 @@ def qrz_login(username, password, verbose=False):
         if verbose:
             print("[qrz_login] xml-post method failed:", e)
 
-    # Fallback: try GET style (older installations used query params)
+    # Fallback: GET with query params
     try:
         params = {"username": username, "password": password}
-        resp2 = requests.get(
+        resp2 = HTTP.get(
             QRZ_XML_LOGIN_URL,
             params=params,
             headers={"User-Agent": USER_AGENT},
@@ -218,20 +228,39 @@ def qrz_login(username, password, verbose=False):
     except Exception as e:
         if verbose:
             print("[qrz_login] fallback method failed:", e)
+
     raise RuntimeError(
         "QRZ login failed. Make sure your account has XML privileges (subscription) and credentials are correct."
     )
 
-def qrz_lookup_call(session_key, callsign, verbose=False):
+
+def qrz_lookup_call(session_key, callsign, verbose=False, relogin_cb=None):
     """
     Looks up a single callsign via QRZ XML API, returns dict or None.
+    If session timeout is detected and relogin_cb is provided, will re-login once.
     """
     params = {"s": session_key, "callsign": callsign}
-    resp = requests.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
+    resp = HTTP.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
     root = ET.fromstring(resp.text)
-    # The QRZ xml returns <Callsign><addr>... etc. We'll try to extract name, address fields.
+
+    # Detect session errors
+    session = find_first(root, "Session")
+    if session is not None:
+        err = find_text(session, "Error")
+        if err and ("Session Timeout" in err or "Invalid session key" in err) and relogin_cb:
+            if verbose:
+                print("[qrz_lookup_call] session timeout; attempting re-login")
+            new_key = relogin_cb()
+            if not new_key:
+                raise RuntimeError("QRZ session expired and re-login failed")
+            params["s"] = new_key
+            resp = HTTP.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
+            if resp.status_code != 200:
+                raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
+            root = ET.fromstring(resp.text)
+
     call = find_first(root, "call", "Callsign")
     if call is None:
         return None
@@ -249,25 +278,32 @@ def qrz_lookup_call(session_key, callsign, verbose=False):
         "zipcode": get_text("zipcode") or get_text("postcode"),
         "country": get_text("country"),
     }
-    parts = [data.get("addr1"), data.get("addr2"), data.get("city"), data.get("state"), data.get("zipcode"), data.get("country")]
+    parts = [data.get("addr1"), data.get("addr2"), data.get("city"), data.get("state"),
+             data.get("zipcode"), data.get("country")]
     addr = ", ".join([p for p in parts if p])
     data["address"] = addr
     if verbose:
         print(f"[qrz_lookup_call] {callsign} -> {addr}")
     return data
 
+
 # ---------- Worker Thread ----------
+CALL_RE = re.compile(r"^[A-Z0-9/]{3,}$")
+
 
 class LookupWorker(threading.Thread):
-    def __init__(self, callsigns, session_key, geocode_mode, google_key, output_queue, verbose=False):
+    def __init__(self, callsigns, session_key, geocode_mode, google_key,
+                 nominatim_email, output_queue, relogin_cb=None, verbose=False):
         super().__init__()
         self.callsigns = callsigns
         self.session_key = session_key
         self.geocode_mode = geocode_mode
         self.google_key = google_key
+        self.nominatim_email = nominatim_email or "you@example.com"
         self.out_q = output_queue
         self.verbose = verbose
         self._stop = threading.Event()
+        self.relogin_cb = relogin_cb
 
     def stop(self):
         self._stop.set()
@@ -281,24 +317,40 @@ class LookupWorker(threading.Thread):
             if self._stop.is_set():
                 break
             try:
+                # Validate callsign quickly
+                if not CALL_RE.match(cs):
+                    self.out_q.put(("log", f"Skipping invalid callsign: {cs}"))
+                    processed += 1
+                    continue
+
+                # QRZ lookup (if session key present)
                 if self.session_key:
-                    info = qrz_lookup_call(self.session_key, cs, verbose=self.verbose)
+                    info = qrz_lookup_call(self.session_key, cs, verbose=self.verbose, relogin_cb=self.relogin_cb)
                     if info is None:
                         self.out_q.put(("log", f"No QRZ result for {cs}"))
                         info = {"callsign": cs, "address": ""}
                 else:
                     info = {"callsign": cs, "address": ""}
-                # geocode if address exists
+
+                if self._stop.is_set():
+                    break
+
+                # Geocode if address exists
                 lat = lon = None
                 addr = info.get("address", "")
                 if addr:
                     try:
                         if self.geocode_mode == "google" and self.google_key:
-                            loc = geocode_google(addr, self.google_key, verbose=self.verbose)
+                            loc, status = geocode_google(addr, self.google_key, verbose=self.verbose)
+                            if loc:
+                                lat, lon = loc
+                            else:
+                                self.out_q.put(("log", f"Google geocode status for '{cs}': {status}"))
                         else:
-                            loc = geocode_nominatim(addr, verbose=self.verbose)
+                            loc = geocode_nominatim(addr, email=self.nominatim_email, verbose=self.verbose)
+                            if loc:
+                                lat, lon = loc
                         if loc:
-                            lat, lon = loc
                             info["lat"] = lat
                             info["lon"] = lon
                         else:
@@ -308,19 +360,22 @@ class LookupWorker(threading.Thread):
                         self.out_q.put(("log", f"Geocode error for {cs}: {ge}"))
                 else:
                     info["lat"] = info["lon"] = ""
+
                 recs.append(info)
             except Exception as e:
                 self.out_q.put(("log", f"Error processing {cs}: {e}"))
+
             processed += 1
             elapsed = now_ts() - start
             avg = elapsed / processed if processed else 0.0001
             remaining = total - processed
             eta = remaining * avg
-            self.out_q.put(("progress", {"processed": processed, "total": total, "elapsed": elapsed, "eta": eta, "last": cs}))
+            self.out_q.put(("progress", {"processed": processed, "total": total,
+                                         "elapsed": elapsed, "eta": eta, "last": cs}))
         self.out_q.put(("finished", recs))
 
-# ---------- GUI Application ----------
 
+# ---------- GUI Application ----------
 class App:
     def __init__(self, root):
         self.root = root
@@ -365,24 +420,31 @@ class App:
         self.google_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.google_var, width=60).grid(row=7, column=1, columnspan=2)
 
+        ttk.Label(frm, text="Nominatim contact email (OSM policy):").grid(row=8, column=0, sticky="w")
+        self.email_var = tk.StringVar(value="you@example.com")
+        ttk.Entry(frm, textvariable=self.email_var, width=60).grid(row=8, column=1, columnspan=2)
+
         self.verbose = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frm,
             text="Verbose output",
             variable=self.verbose,
             command=self.toggle_verbose,
-        ).grid(row=8, column=0, sticky="w")
+        ).grid(row=9, column=0, sticky="w")
 
         # Progress bar and controls
-        ttk.Separator(frm, orient="horizontal").grid(row=9, column=0, columnspan=3, sticky="ew", pady=6)
+        ttk.Separator(frm, orient="horizontal").grid(row=10, column=0, columnspan=3, sticky="ew", pady=6)
         self.progress = ttk.Progressbar(frm, orient="horizontal", length=400, mode="determinate")
-        self.progress.grid(row=10, column=0, columnspan=2, sticky="w")
+        self.progress.grid(row=11, column=0, columnspan=2, sticky="w")
         self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=10, column=2, sticky="w")
+        ttk.Label(frm, textvariable=self.status_var).grid(row=11, column=2, sticky="w")
 
-        ttk.Button(frm, text="Start", command=self.start).grid(row=11, column=0, sticky="we", pady=6)
-        ttk.Button(frm, text="Stop", command=self.stop).grid(row=11, column=1, sticky="we", pady=6)
-        ttk.Button(frm, text="Export CSV", command=self.export_csv).grid(row=11, column=2, sticky="we", pady=6)
+        bfrm = ttk.Frame(frm)
+        bfrm.grid(row=12, column=0, columnspan=3, sticky="we", pady=6)
+        ttk.Button(bfrm, text="Start", command=self.start).grid(row=0, column=0, sticky="we", padx=2)
+        ttk.Button(bfrm, text="Stop", command=self.stop).grid(row=0, column=1, sticky="we", padx=2)
+        ttk.Button(bfrm, text="Export CSV", command=self.export_csv).grid(row=0, column=2, sticky="we", padx=2)
+        ttk.Button(bfrm, text="Clear Log", command=self.clear_log).grid(row=0, column=3, sticky="we", padx=2)
 
         # Log / verbose pane
         ttk.Label(root, text="Log / Output:").grid(row=1, column=0, sticky="w")
@@ -400,6 +462,10 @@ class App:
         self.records = []
         self.session_key = None
 
+        # cache creds for re-login callback
+        self.cached_user = ""
+        self.cached_pass = ""
+
         self.root.after(200, self.poll_queue)
 
     def toggle_verbose(self):
@@ -407,7 +473,7 @@ class App:
         self.log(f"Verbose output {state}", lvl="info")
 
     def browse_csv(self):
-        p = filedialog.askopenfilename(filetypes=[("CSV","*.csv"), ("All files","*.*")])
+        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
         if p:
             self.csv_var.set(p)
 
@@ -416,22 +482,40 @@ class App:
         key = self.api_key_var.get().strip()
         if key:
             self.session_key = key
-            self.log(f"Using provided QRZ session key (length {len(key)})", lvl="info")
+            # mask: first 4 and last 4
+            masked = key[:4] + "..." + key[-4:] if len(key) >= 8 else "****"
+            self.log(f"Using provided QRZ session key ({masked})", lvl="info")
         else:
             u = self.u_var.get().strip()
             p = self.p_var.get()
             if not (u and p):
                 messagebox.showinfo("Login", "Either enter a QRZ API session key or username/password.")
                 return
+            self.cached_user, self.cached_pass = u, p
             self.log(f"Logging into QRZ as {u} ...", lvl="info")
+
             def do_login():
                 try:
                     sk = qrz_login(u, p, verbose=self.verbose.get())
                     self.session_key = sk
-                    self.log(f"QRZ session key obtained (stored in memory).", lvl="info")
+                    self.log("QRZ session key obtained (stored in memory).", lvl="info")
                 except Exception as e:
                     self.log(f"QRZ login failed: {e}", lvl="error")
+
             threading.Thread(target=do_login, daemon=True).start()
+
+    def relogin_cb(self):
+        # Only possible if we have cached user/pass and no explicit key was provided
+        if self.cached_user and self.cached_pass:
+            try:
+                sk = qrz_login(self.cached_user, self.cached_pass, verbose=self.verbose.get())
+                self.session_key = sk
+                self.log("QRZ session renewed.", lvl="info")
+                return sk
+            except Exception as e:
+                self.log(f"Re-login failed: {e}", lvl="error")
+                return None
+        return None
 
     def gather_callsigns(self):
         calls = []
@@ -441,22 +525,33 @@ class App:
             try:
                 with open(p, newline="", encoding="utf-8") as fh:
                     rdr = csv.reader(fh)
+                    header = next(rdr, None)
+                    # If header contains "callsign", use that; else assume first col
+                    idx = 0
+                    if header and any(h.lower() == "callsign" for h in header):
+                        idx = [i for i, h in enumerate(header) if h.lower() == "callsign"][0]
+                    else:
+                        # push header row into data if it's actually data (no letters)
+                        if header and header and header[0] and header[0].strip().upper() != "CALLSIGN":
+                            calls.append(header[0].strip())
                     for row in rdr:
-                        if row and row[0].strip():
-                            calls.append(row[0].strip())
+                        if row and len(row) > idx and row[idx].strip():
+                            calls.append(row[idx].strip())
             except Exception as e:
                 self.log(f"Error reading CSV: {e}", lvl="error")
+
         # from text area
         txt = self.callsign_text.get("1.0", "end").strip()
         if txt:
             parts = [x.strip() for x in (txt.replace(",", "\n")).splitlines()]
             calls.extend([c for c in parts if c])
-        # dedupe, uppercase
+
+        # dedupe, uppercase, validate
         seen = set()
         out = []
         for c in calls:
             cu = c.upper()
-            if cu not in seen:
+            if cu not in seen and CALL_RE.match(cu):
                 seen.add(cu)
                 out.append(cu)
         return out
@@ -474,7 +569,16 @@ class App:
         self.progress["value"] = 0
         self.status_var.set("Starting...")
         self.log(f"Processing {len(calls)} callsigns; geocode: {self.gc_mode.get()}", lvl="info")
-        self.worker = LookupWorker(calls, self.session_key, self.gc_mode.get(), self.google_var.get().strip(), self.queue, verbose=self.verbose.get())
+        self.worker = LookupWorker(
+            callsigns=calls,
+            session_key=self.session_key,
+            geocode_mode=self.gc_mode.get(),
+            google_key=self.google_var.get().strip(),
+            nominatim_email=self.email_var.get().strip() or "you@example.com",
+            output_queue=self.queue,
+            relogin_cb=self.relogin_cb if (self.session_key and not self.api_key_var.get().strip()) else None,
+            verbose=self.verbose.get(),
+        )
         self.worker.daemon = True
         self.worker.start()
 
@@ -513,21 +617,23 @@ class App:
         self.log_text.insert("end", f"[{ts}] [{lvl}] {msg}\n")
         self.log_text.see("end")
 
+    def clear_log(self):
+        self.log_text.delete("1.0", "end")
+
     def export_csv(self):
         if not self.records:
             messagebox.showinfo("No data", "No results to export")
             return
-        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
+        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
         if not p:
             return
-        # collect all keys
-        keys = set()
-        for r in self.records:
-            keys.update(r.keys())
-        keys = list(keys)
+        # stable, friendly column order
+        preferred = ["callsign", "fname", "addr1", "addr2", "city", "state", "zipcode", "country", "address", "lat", "lon"]
+        present = set().union(*(r.keys() for r in self.records))
+        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
         try:
             with open(p, "w", newline="", encoding="utf-8") as fh:
-                w = csv.DictWriter(fh, fieldnames=keys)
+                w = csv.DictWriter(fh, fieldnames=fieldnames)
                 w.writeheader()
                 for r in self.records:
                     w.writerow(r)
@@ -539,7 +645,7 @@ class App:
         if not self.records:
             messagebox.showinfo("No data", "No results to export")
             return
-        p = filedialog.asksaveasfilename(defaultextension=".kml", filetypes=[("KML","*.kml")])
+        p = filedialog.asksaveasfilename(defaultextension=".kml", filetypes=[("KML", "*.kml")])
         if not p:
             return
         k = simplekml.Kml()
@@ -549,7 +655,11 @@ class App:
             if lat and lon:
                 name = r.get("callsign", "")
                 desc = r.get("address", "")
-                k.newpoint(name=name, coords=[(float(lon), float(lat))], description=desc)
+                try:
+                    latf, lonf = float(lat), float(lon)
+                except Exception:
+                    continue
+                k.newpoint(name=name, coords=[(lonf, latf)], description=desc)
         try:
             k.save(p)
             self.log(f"KML saved: {p}", lvl="info")
@@ -560,7 +670,7 @@ class App:
         if not self.records:
             messagebox.showinfo("No data", "No results to export")
             return
-        p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML","*.html")])
+        p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML", "*.html")])
         if not p:
             return
         pts = []
@@ -568,19 +678,32 @@ class App:
             lat = r.get("lat")
             lon = r.get("lon")
             if lat and lon:
-                pts.append({"callsign": r.get("callsign",""), "lat": lat, "lon": lon, "address": r.get("address","")})
+                try:
+                    latf, lonf = float(lat), float(lon)
+                except Exception:
+                    continue
+                pts.append({"callsign": r.get("callsign", ""), "lat": latf, "lon": lonf, "address": r.get("address", "")})
         if not pts:
             messagebox.showinfo("No geocoded points", "No latitude/longitude data available")
             return
-        # center
-        clat = sum(float(p["lat"]) for p in pts)/len(pts)
-        clon = sum(float(p["lon"]) for p in pts)/len(pts)
+
+        # Compute bounds
+        lats = [pt["lat"] for pt in pts]
+        lons = [pt["lon"] for pt in pts]
+        min_lat, max_lat = min(lats), max(lats)
+        min_lon, max_lon = min(lons), max(lons)
+        clat = (min_lat + max_lat) / 2.0
+        clon = (min_lon + max_lon) / 2.0
+
         gm_key = self.google_var.get().strip()
         if gm_key:
             # Google Maps HTML
-            markers = []
+            markers_js = []
             for pt in pts:
-                markers.append(f"new google.maps.Marker({{position: {{lat: {pt['lat']}, lng: {pt['lon']}}}, map: map, title: '{pt['callsign']}'}});")
+                title = json.dumps(pt['callsign'])
+                markers_js.append(
+                    f"new google.maps.Marker({{position: {{lat: {pt['lat']}, lng: {pt['lon']}}}, map: map, title: {title}}});"
+                )
             html = f"""<!doctype html>
 <html>
   <head>
@@ -593,20 +716,24 @@ class App:
     <script src="https://maps.googleapis.com/maps/api/js?key={gm_key}"></script>
     <script>
       function initMap() {{
-        var center = {{lat: {clat}, lng: {clon}}};
-        var map = new google.maps.Map(document.getElementById('map'), {{zoom: 8, center: center}});
-        {"".join(markers)}
+        var map = new google.maps.Map(document.getElementById('map'), {{zoom: 8, center: {{lat: {clat}, lng: {clon}}}}});
+        var bounds = new google.maps.LatLngBounds(
+          new google.maps.LatLng({min_lat}, {min_lon}),
+          new google.maps.LatLng({max_lat}, {max_lon})
+        );
+        {''.join(markers_js)}
+        map.fitBounds(bounds);
       }}
       window.onload = initMap;
     </script>
   </body>
 </html>"""
         else:
-            # Leaflet fallback
+            # Leaflet fallback (safe JSON popups)
             mk = []
             for pt in pts:
-                popup = f"{pt['callsign']}<br/>{pt['address']}".replace("'", "\\'")
-                mk.append(f"L.marker([{pt['lat']}, {pt['lon']}]).addTo(map).bindPopup('{popup}');")
+                popup = json.dumps(f"{pt['callsign']}\n{pt['address']}").replace("\\n", "<br/>")
+                mk.append(f"L.marker([{pt['lat']}, {pt['lon']}]).addTo(map).bindPopup({popup});")
             html = f"""<!doctype html>
 <html>
   <head>
@@ -619,7 +746,9 @@ class App:
     <div id="map"></div>
     <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
     <script>
-      var map = L.map('map').setView([{clat}, {clon}], 8);
+      var map = L.map('map');
+      var bounds = L.latLngBounds([[{min_lat}, {min_lon}], [{max_lat}, {max_lon}]]);
+      map.fitBounds(bounds);
       L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
         maxZoom: 19,
         attribution: '© OpenStreetMap contributors'
@@ -628,6 +757,7 @@ class App:
     </script>
   </body>
 </html>"""
+
         try:
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write(html)
@@ -635,10 +765,15 @@ class App:
         except Exception as e:
             self.log(f"HTML save error: {e}", lvl="error")
 
+
 def main():
     root = tk.Tk()
+    # make the main window a bit more flexible
+    root.rowconfigure(2, weight=1)
+    root.columnconfigure(0, weight=1)
     app = App(root)
     root.mainloop()
+
 
 if __name__ == "__main__":
     main()

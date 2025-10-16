@@ -12,7 +12,7 @@ The tool now supports:
 - Optional use of your **QRZ XML API key** for authenticated lookups
 - A **GUI interface** that runs on any platform
 - **CSV export**
-- **Google Maps / Google Earth overlays (KML)**
+- **Interactive HTML map export**
 - **Verbose mode** for detailed execution logging
 - **Elapsed time and ETA tracking**
 
@@ -28,7 +28,7 @@ The tool now supports:
 | 🖥️ **Cross-Platform GUI** | Works on Windows, macOS, and Linux |
 | 📊 **Progress and ETA Tracking** | Displays time elapsed and estimated completion |
 | 🗂️ **CSV Export** | Saves results locally for data analysis |
-| 🌍 **Map Overlay (KML)** | Plots call signs on Google Earth or Google My Maps |
+| 🌍 **Interactive Map Export** | Generates a shareable HTML map using Google Maps or Leaflet |
 | 🧩 **Verbose Mode** | Displays detailed execution steps for debugging or transparency |
 
 ---
@@ -43,4 +43,4 @@ The script automatically checks for and installs missing modules on startup.
 If needed, you can manually install dependencies with:
 
 ```bash
-pip install requests beautifulsoup4 pandas tk tqdm geopy simplekml
+pip install requests pandas tk geopy geojson
