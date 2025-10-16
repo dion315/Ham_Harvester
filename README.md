@@ -3,35 +3,44 @@
 
 ## Overview
 
-The **QRZ County Ham Lookup Tool** is a Python-based cross-platform application that queries **QRZ.com** for all licensed amateur radio operators (Hams) within a specified **county and state** in the United States.
+The **QRZ County Ham Lookup Tool** is a Python-based, cross-platform utility that retrieves licensed amateur radio operators (Hams) registered on **QRZ.com** for a specified **county and state** in the U.S.  
 
-It includes:
-- A **GUI interface** for ease of use on Windows, macOS, and Linux.
-- A **verbose mode** for detailed console output.
-- An **elapsed time and ETA** progress tracker.
-- Options to **export results to CSV**.
-- The ability to **map licensee locations** in Google Maps or Google Earth (via KML overlay generation).
+It’s designed for ease of use, flexibility, and portability — whether you’re a club coordinator, emergency communications planner, or ham enthusiast mapping local operators.
 
-This tool is ideal for ham radio enthusiasts, club coordinators, emergency communications planners, or researchers looking to visualize call sign data geographically.
+The tool now supports:
+- Automatic **dependency checking and installation**
+- Optional use of your **QRZ XML API key** for authenticated lookups
+- A **GUI interface** that runs on any platform
+- **CSV export**
+- **Google Maps / Google Earth overlays (KML)**
+- **Verbose mode** for detailed execution logging
+- **Elapsed time and ETA tracking**
 
 ---
 
 ## Features
 
-- 🔍 **Query QRZ.com** by county and state  
-- 🖥️ **Cross-platform GUI** (runs anywhere Python and Tkinter are supported)  
-- 📊 **Progress tracking** with elapsed time and estimated completion time  
-- 🗂️ **Export results** to a CSV file  
-- 🌍 **Google Maps / Google Earth overlay** option  
-- 🧩 **Verbose mode** for debugging or detailed monitoring  
+| Feature | Description |
+|----------|--------------|
+| 🧰 **Automatic Dependency Management** | Ensures all required Python packages are installed before execution |
+| 🔍 **QRZ.com Query** | Searches licensed operators by state and county |
+| 🔑 **API Integration** | Supports QRZ XML Subscription API key for higher reliability and no scraping |
+| 🖥️ **Cross-Platform GUI** | Works on Windows, macOS, and Linux |
+| 📊 **Progress and ETA Tracking** | Displays time elapsed and estimated completion |
+| 🗂️ **CSV Export** | Saves results locally for data analysis |
+| 🌍 **Map Overlay (KML)** | Plots call signs on Google Earth or Google My Maps |
+| 🧩 **Verbose Mode** | Displays detailed execution steps for debugging or transparency |
 
 ---
 
 ## Requirements
 
-### Dependencies
+### Python Version
+- **Python 3.9+** required
 
-- **Python 3.9+**
-- The following Python libraries:
-  ```bash
-  pip install requests beautifulsoup4 pandas tk tqdm geopy simplekml
+### Dependencies
+The script automatically checks for and installs missing modules on startup.  
+If needed, you can manually install dependencies with:
+
+```bash
+pip install requests beautifulsoup4 pandas tk tqdm geopy simplekml
