@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ham Harvester / QRZ Mapper — Guided Flow (login-first, robust county loading)
+Ham Harvester / QRZ Mapper — Guided Flow (v3.2)
 
 Flow:
 1) Modal login (QRZ XML API key OR username/password) before the main UI.
@@ -76,7 +76,7 @@ from geopy.geocoders import Nominatim as GeoNominatim  # optional; using direct 
 import simplekml
 
 # ---------- Globals ----------
-APP_AGENT = "HamHarvester/3.1"
+APP_AGENT = "HamHarvester/3.2"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_AGENT})
 
@@ -644,7 +644,7 @@ class App:
         self.worker = None
         self.queue = queue.Queue()
         self.records = []
-        self.early_logs = []     # <-- buffer logs before log_text exists
+        self.early_logs = []     # buffer logs before log_text exists
 
         # --- Modal login first (but buffer logs safely) ---
         self.prompt_login()
@@ -779,7 +779,6 @@ class App:
 
     # --- Small helper to avoid touching log_text before it's created
     def _buffer_or_print(self, line):
-        # If log_text exists, write; otherwise buffer and print to console
         if hasattr(self, "log_text") and self.log_text:
             self.log_text.insert("end", line + "\n")
             self.log_text.see("end")
@@ -787,24 +786,52 @@ class App:
             self.early_logs.append(line)
             print(line)
 
-    # --- Mode management ---
+    # ---------- NEW: Robust group enable/disable ----------
+    def _set_group_enabled(self, container, enabled: bool):
+        """
+        Safely enable/disable all interactive children in a container.
+        Skips labels/frames and handles widget-specific semantics.
+        """
+        txt_state = tk.NORMAL if enabled else tk.DISABLED
+        combo_state = "readonly" if enabled else "disabled"
+        btn_state = "normal" if enabled else "disabled"
+
+        for child in container.winfo_children():
+            try:
+                # Specific widget handling
+                if isinstance(child, scrolledtext.ScrolledText):
+                    child.configure(state=txt_state)
+                elif isinstance(child, tk.Text):
+                    child.configure(state=txt_state)
+                elif isinstance(child, tk.Listbox):
+                    child.configure(state=txt_state)
+                elif isinstance(child, (ttk.Entry, tk.Entry)):
+                    child.configure(state=txt_state)
+                elif isinstance(child, ttk.Combobox):
+                    child.configure(state=combo_state)
+                elif isinstance(child, (ttk.Button, tk.Button, ttk.Checkbutton, ttk.Radiobutton)):
+                    child.configure(state=btn_state)
+                elif isinstance(child, (ttk.Spinbox, tk.Spinbox)):
+                    child.configure(state=btn_state)
+                else:
+                    # Some ttk widgets accept state; many (Label/Frame) don't. Ignore errors.
+                    child.configure(state=btn_state)
+            except tk.TclError:
+                pass
+
+            # Recurse into nested containers
+            if isinstance(child, (ttk.Frame, tk.Frame, ttk.LabelFrame)):
+                self._set_group_enabled(child, enabled)
+
+    # --- Mode management (uses the robust toggler) ---
     def update_mode_state(self):
         m = self.mode.get()
-        # Mode A: show calls_frame; Mode B/C: show geo_frame
         if m == "calls":
-            self.calls_frame.state(["!disabled"])
-            for child in self.calls_frame.winfo_children():
-                child.configure(state="normal")
-            self.geo_frame.state(["disabled"])
-            for child in self.geo_frame.winfo_children():
-                child.configure(state="disabled")
+            self._set_group_enabled(self.calls_frame, True)
+            self._set_group_enabled(self.geo_frame, False)
         else:
-            self.geo_frame.state(["!disabled"])
-            for child in self.geo_frame.winfo_children():
-                child.configure(state="normal")
-            self.calls_frame.state(["disabled"])
-            for child in self.calls_frame.winfo_children():
-                child.configure(state="disabled")
+            self._set_group_enabled(self.geo_frame, True)
+            self._set_group_enabled(self.calls_frame, False)
 
     # --- UI helpers ---
     def log(self, msg, lvl="info"):
