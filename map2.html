@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>html,body,#map{height:100%;margin:0;padding:0}</style></head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+var map = L.map('map');
+var bounds = L.latLngBounds([[42.9787914, -76.1838843], [43.3424015, -75.7160388]]);
+map.fitBounds(bounds);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 19, attribution: '© OpenStreetMap contributors'
+}).addTo(map);
+L.marker([43.0389539, -75.8660299]).addTo(map).bindPopup("N2SEC<br/>311 FALLS BLVD, CHITTENANGO, NY, United States");L.marker([43.1619263, -75.9832948]).addTo(map).bindPopup("WA2KFV<br/>7856 Beaver Ln., BRIDGEPORT, NY, United States");L.marker([42.9787914, -75.7160388]).addTo(map).bindPopup("W2ZXN<br/>5801 Oxbow Rd, Canastota, NY, United States");L.marker([43.3424015, -75.7363132]).addTo(map).bindPopup("AK2Z<br/>48 WOLCOTT ST, CAMDEN, NY, United States");L.marker([43.146585, -76.1838843]).addTo(map).bindPopup("K2VTT<br/>4778 STONEHURST RD, LIVERPOOL, NY, United States");
+</script></body></html>

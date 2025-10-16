@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-QRZ County / Callsign Mapper (State/County Harvester + GUI)
+QRZ County / Callsign Mapper (State/County Harvester + GUI, Census API county list)
 
-- State dropdown + county multi-select (auto-loads from US Census & caches).
+- State dropdown + county multi-select.
+- Counties are fetched on demand from the Census API using an embedded state→FIPS map.
 - "Harvest FCC by County":
     * Queries FCC ULS Geographic Search for Amateur (HA/HV) Active licenses.
     * Extracts callsigns, enriches via QRZ XML (name, address, email).
@@ -37,7 +38,6 @@ except Exception:
           "On Fedora: sudo dnf install python3-tkinter\n"
           "On Windows/macOS: install standard Python from python.org (tkinter included).")
     sys.exit(1)
-
 
 # ---- ensure deps (pip) ----
 def ensure_deps(verbose=False):
@@ -76,7 +76,7 @@ from geopy.geocoders import Nominatim as GeoNominatim  # not strictly required, 
 import simplekml
 
 # ---------- Globals ----------
-APP_AGENT = "QRZ-Mapper/2.1"
+APP_AGENT = "QRZ-Mapper/2.2"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_AGENT})
 QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
@@ -84,6 +84,20 @@ USER_AGENT = APP_AGENT
 
 # FCC constants
 FCC_BASE = "https://wireless2.fcc.gov/UlsApp/UlsSearch/searchGeographic.jsp"
+
+# Census counties API (we’ll request: get=NAME&for=county:*&in=state:XX)
+CENSUS_API_TEMPLATE = "https://api.census.gov/data/2023/pep/population?get=NAME&for=county:*&in=state:{state_fips}"
+
+# Embedded USPS → FIPS (50 states + DC + PR)
+STATE_ABBR_TO_FIPS = {
+    "AL":"01","AK":"02","AZ":"04","AR":"05","CA":"06","CO":"08","CT":"09","DE":"10","DC":"11",
+    "FL":"12","GA":"13","HI":"15","ID":"16","IL":"17","IN":"18","IA":"19","KS":"20","KY":"21",
+    "LA":"22","ME":"23","MD":"24","MA":"25","MI":"26","MN":"27","MS":"28","MO":"29",
+    "MT":"30","NE":"31","NV":"32","NH":"33","NJ":"34","NM":"35","NY":"36","NC":"37","ND":"38",
+    "OH":"39","OK":"40","OR":"41","PA":"42","RI":"44","SC":"45","SD":"46","TN":"47","TX":"48",
+    "UT":"49","VT":"50","VA":"51","WA":"53","WV":"54","WI":"55","WY":"56",
+    "PR":"72"
+}
 
 # --- Utility ---
 def now_ts():
@@ -255,46 +269,33 @@ def qrz_lookup_call(session_key, callsign, verbose=False):
         print(f"[qrz_lookup_call] {callsign} -> {data['address']}")
     return data
 
-# --- FCC county list (Census) ---
-COUNTY_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "ham_harvester")
-COUNTY_FILE = os.path.join(COUNTY_CACHE, "us_counties.csv")
-CENSUS_URL = "https://www2.census.gov/geo/docs/reference/codes/files/national_county.txt"
-# Record layout (repeating 5-tuple): STATE,STATEFP,COUNTYFP,COUNTYNAME,CLASSFP
-
-def ensure_county_csv(log):
-    os.makedirs(COUNTY_CACHE, exist_ok=True)
-    if os.path.exists(COUNTY_FILE):
-        return
-    log(f"Downloading US county list from Census: {CENSUS_URL}", "info")
-    r = HTTP.get(CENSUS_URL, timeout=30)
+# --- County list via Census API ---
+def fetch_counties_for_state(state_abbr):
+    """
+    Fetch counties for a given USPS state abbreviation using the Census API.
+    Returns a sorted list of county names like "Albany County", "Kings County", etc.
+    """
+    st = (state_abbr or "").strip().upper()
+    fips = STATE_ABBR_TO_FIPS.get(st)
+    if not fips:
+        return []
+    url = CENSUS_API_TEMPLATE.format(state_fips=fips)
+    r = HTTP.get(url, timeout=20)
     if r.status_code != 200:
-        raise RuntimeError(f"Failed to fetch county list: HTTP {r.status_code}")
-    with open(COUNTY_FILE, "w", encoding="utf-8") as fh:
-        fh.write(r.text)
-
-def load_state_to_counties():
-    """
-    The Census file can be one (or a few) very long lines, with tokens repeating as:
-    STATE, STATEFP, COUNTYFP, COUNTYNAME, CLASSFP
-    We parse the entire text into tokens and step through in groups of 5.
-    """
-    state_to_counties = {}
-    if not os.path.exists(COUNTY_FILE):
-        return state_to_counties
-
-    with open(COUNTY_FILE, encoding="utf-8") as fh:
-        raw = fh.read()
-
-    tokens = [t.strip() for t in raw.replace("\n", ",").split(",") if t.strip()]
-    for i in range(0, len(tokens) - 4, 5):
-        state_abbr = tokens[i]
-        county_name = tokens[i + 3]
-        state_to_counties.setdefault(state_abbr, []).append(county_name)
-
-    for k in state_to_counties:
-        state_to_counties[k].sort()
-
-    return state_to_counties
+        return []
+    try:
+        data = r.json()
+        # data[0] is header, rows like ["Albany County, New York","36","001"]
+        out = []
+        for row in data[1:]:
+            name = row[0]  # "Albany County, New York"
+            # Strip ", State Name"
+            if "," in name:
+                name = name.split(",", 1)[0].strip()
+            out.append(name)
+        return sorted(set(out))
+    except Exception:
+        return []
 
 # --- FCC ULS harvesting (scraper) ---
 CALL_RE = re.compile(r"^[A-Z0-9/]{3,}$")
@@ -309,9 +310,10 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
         # Start session (some pages require it)
         HTTP.get(FCC_BASE, timeout=30)
 
+        # FCC is picky about county text — we try the plain county name first.
         payload = {
             "state": state_abbr,
-            "county": county_name,
+            "county": county_name,              # e.g., "Albany County"
             "servRadioServiceCode": "HA,HV",
             "licStatus": "Active",
             "ulsSearchType": "geographic",
@@ -321,7 +323,9 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
         if resp.status_code != 200:
             raise RuntimeError(f"FCC search HTTP {resp.status_code}")
 
+        pages = 0
         while True:
+            pages += 1
             soup = BeautifulSoup(resp.text, "html.parser")
             for a in soup.find_all("a"):
                 txt = (a.get_text() or "").strip().upper()
@@ -338,7 +342,7 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
             if resp.status_code != 200:
                 break
         if verbose:
-            print(f"[fcc_search] {state_abbr}/{county_name}: {len(calls)} callsigns")
+            print(f"[fcc_search] {state_abbr}/{county_name}: {len(calls)} callsigns, {pages} page(s)")
         return calls
     except Exception as e:
         if verbose:
@@ -373,6 +377,8 @@ class CountyHarvestWorker(threading.Thread):
                 polite_sleep=1.2 if self.polite else 0.2,
                 verbose=self.verbose
             )
+            if not cs:
+                self.out_q.put(("log", f"No calls returned for {county} — if persistent, try a neighboring county name variant (e.g., no 'County' suffix)."))
             all_calls.update(cs)
             self.out_q.put(("progress", {
                 "processed": i, "total": len(self.counties),
@@ -498,7 +504,8 @@ class App:
 
         ttk.Label(state_row, text="State:").grid(row=0, column=0, sticky="w")
         self.state_var = tk.StringVar(value="")
-        self.state_combo = ttk.Combobox(state_row, textvariable=self.state_var, width=6, values=[])
+        self.state_combo = ttk.Combobox(state_row, textvariable=self.state_var, width=6,
+                                        values=sorted(STATE_ABBR_TO_FIPS.keys()))
         self.state_combo.grid(row=0, column=1, sticky="w", padx=4)
 
         # Update counties when user selects from dropdown... and when they type.
@@ -506,7 +513,7 @@ class App:
         self.state_var.trace_add("write", lambda *_: self.on_state_selected())
 
         ttk.Label(state_row, text="Counties (Ctrl/Cmd-click to select multiple):").grid(row=0, column=2, padx=(16, 4), sticky="w")
-        self.county_list = tk.Listbox(state_row, selectmode="extended", width=40, height=6, exportselection=False)
+        self.county_list = tk.Listbox(state_row, selectmode="extended", width=40, height=7, exportselection=False)
         self.county_list.grid(row=0, column=3, sticky="w")
 
         self.polite = tk.BooleanVar(value=True)
@@ -539,17 +546,6 @@ class App:
         ttk.Button(mfrm, text="Export KML", command=self.export_kml).grid(row=0, column=0, padx=4)
         ttk.Button(mfrm, text="Export HTML Map", command=self.export_html).grid(row=0, column=1, padx=4)
 
-        # State setup
-        try:
-            ensure_county_csv(self.log)
-            self.state_to_counties = load_state_to_counties()
-            self.state_combo["values"] = sorted(self.state_to_counties.keys())
-            if not self.state_to_counties:
-                self.log("County database is empty; check network or Census URL.", "error")
-        except Exception as e:
-            self.state_to_counties = {}
-            self.log(f"County list load error: {e}", "error")
-
         self.worker = None
         self.queue = queue.Queue()
         self.records = []
@@ -569,9 +565,14 @@ class App:
     def on_state_selected(self, _evt=None):
         st = (self.state_var.get() or "").strip().upper()
         self.county_list.delete(0, "end")
-        if not st or st not in self.state_to_counties:
+        if not st or st not in STATE_ABBR_TO_FIPS:
             return
-        for c in self.state_to_counties.get(st, []):
+        self.log(f"Loading counties for {st} ...", "info")
+        counties = fetch_counties_for_state(st)
+        if not counties:
+            self.log(f"Could not load counties for {st}. Check network or try again.", "error")
+            return
+        for c in counties:
             self.county_list.insert("end", c)
 
     def get_selected_counties(self):
