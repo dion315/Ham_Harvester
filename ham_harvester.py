@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-QRZ County / Callsign Mapper (GUI + Dependency Auto-Install + API Key Option)
+QRZ County / Callsign Mapper (GUI + No Auto-Pip + Optional KML)
 
-- Verifies and installs missing dependencies at runtime (except tkinter).
-- Supports providing a QRZ XML API session key directly (if you already have it).
-- GUI for callsign lookup, geocoding, progress/ETA display.
-- Export to CSV, KML, HTML map (Google Maps or Leaflet fallback).
-- Nominatim usage made policy-friendly (contact email, backoff).
+- No auto-installs (PEP 668 safe). Only requires: tkinter (OS package) + requests.
+- KML export is optional (simplekml). If absent, KML button is disabled.
+- Supports QRZ XML API session key or user/pass login.
+- Geocoding via Nominatim (policy-friendly) or Google (with API key).
+- Exports: CSV, KML (if available), HTML (Leaflet/Google).
 """
 
 import sys
-import subprocess
 import importlib
 
 # ---- Ensure tkinter is present first; it's provided by the OS, not pip ----
@@ -24,48 +23,39 @@ except Exception:
           "On Windows/macOS: install standard Python from python.org (tkinter included).")
     sys.exit(1)
 
-
-def check_and_install_dependencies(verbose=False):
+def check_core_dependencies(verbose=False):
     """
-    Checks for required Python packages and installs missing ones automatically.
-    Returns True if all are present (or successfully installed); else exits.
+    Verify core runtime deps. We avoid auto-install on PEP 668 systems and
+    only suggest commands if something's missing.
     """
-    required = [
-        "requests",
-        "simplekml",
-        "pandas",
-        "geopy",
-    ]
+    core_required = ["requests"]  # everything else is optional
     missing = []
-    for pkg in required:
+    for pkg in core_required:
         try:
             importlib.import_module(pkg)
             if verbose:
                 print(f"[OK] {pkg} importable")
         except ImportError:
             missing.append(pkg)
-    if not missing:
-        if verbose:
-            print("[INFO] All dependencies satisfied")
-        return True
 
-    print(f"[INFO] Missing packages: {missing}")
-    print("[INFO] Attempting to install missing packages via pip...")
-    for pkg in missing:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-            if verbose:
-                print(f"[INSTALLED] {pkg}")
-        except Exception as e:
-            print(f"[ERROR] Could not install {pkg}: {e}")
-            print("Please install missing dependency manually and re-run.")
-            sys.exit(1)
-    print("[INFO] All missing dependencies installed.")
+    if missing:
+        print(f"[ERROR] Missing core packages: {missing}")
+        print("Install in a venv:\n  python3 -m venv .venv && source .venv/bin/activate && pip install " +
+              " ".join(missing))
+        sys.exit(1)
+
+    # Optional: simplekml for KML export
+    try:
+        import simplekml  # noqa: F401
+        if verbose:
+            print("[OK] simplekml (KML export enabled)")
+    except ImportError:
+        print("[INFO] simplekml not found — KML export will be disabled. "
+              "Install later with: pip install simplekml (ideally in a venv)")
     return True
 
-
 # Run dependency check early
-check_and_install_dependencies(verbose=True)
+check_core_dependencies(verbose=True)
 
 # ---- Standard libs & deps (safe to import now) ----
 import threading
@@ -77,7 +67,13 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import re
-import simplekml
+
+# Optional KML support flag
+try:
+    import simplekml  # noqa: F401
+    SIMPLEKML_AVAILABLE = True
+except Exception:
+    SIMPLEKML_AVAILABLE = False
 
 # ---------- Globals / HTTP session ----------
 QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
@@ -87,11 +83,9 @@ USER_AGENT = "QRZ-Mapper/1.0"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": USER_AGENT})
 
-
 # ---------- Utility functions ----------
 def now_ts():
     return time.time()
-
 
 def nice_elapsed(seconds):
     if seconds < 60:
@@ -103,7 +97,6 @@ def nice_elapsed(seconds):
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
-
 
 # Basic geocode by OpenStreetMap Nominatim (policy-friendly)
 def geocode_nominatim(address, email="you@example.com", pause=1.0, verbose=False):
@@ -132,7 +125,6 @@ def geocode_nominatim(address, email="you@example.com", pause=1.0, verbose=False
         raise RuntimeError(f"Nominatim HTTP {resp.status_code}")
     return None
 
-
 # Google geocoding
 def geocode_google(address, api_key, verbose=False):
     url = "https://maps.googleapis.com/maps/api/geocode/json"
@@ -149,7 +141,6 @@ def geocode_google(address, api_key, verbose=False):
     loc = j["results"][0]["geometry"]["location"]
     return (loc["lat"], loc["lng"]), "OK"
 
-
 # ---------- XML helpers (namespace-agnostic) ----------
 def find_first(elem, *tag_names):
     """Return the first descendant whose local-name matches any of ``tag_names``."""
@@ -162,7 +153,6 @@ def find_first(elem, *tag_names):
             return node
     return None
 
-
 def find_text(elem, *tag_names):
     if elem is None:
         return ""
@@ -170,7 +160,6 @@ def find_text(elem, *tag_names):
     if node is not None and node.text:
         return node.text.strip()
     return ""
-
 
 # ---------- QRZ XML API logic ----------
 def qrz_login(username, password, verbose=False):
@@ -233,7 +222,6 @@ def qrz_login(username, password, verbose=False):
         "QRZ login failed. Make sure your account has XML privileges (subscription) and credentials are correct."
     )
 
-
 def qrz_lookup_call(session_key, callsign, verbose=False, relogin_cb=None):
     """
     Looks up a single callsign via QRZ XML API, returns dict or None.
@@ -286,10 +274,8 @@ def qrz_lookup_call(session_key, callsign, verbose=False, relogin_cb=None):
         print(f"[qrz_lookup_call] {callsign} -> {addr}")
     return data
 
-
 # ---------- Worker Thread ----------
 CALL_RE = re.compile(r"^[A-Z0-9/]{3,}$")
-
 
 class LookupWorker(threading.Thread):
     def __init__(self, callsigns, session_key, geocode_mode, google_key,
@@ -374,7 +360,6 @@ class LookupWorker(threading.Thread):
                                          "elapsed": elapsed, "eta": eta, "last": cs}))
         self.out_q.put(("finished", recs))
 
-
 # ---------- GUI Application ----------
 class App:
     def __init__(self, root):
@@ -454,8 +439,13 @@ class App:
         # Map export
         mfrm = ttk.Frame(root, padding=6)
         mfrm.grid(row=3, column=0, sticky="ew")
-        ttk.Button(mfrm, text="Export KML", command=self.export_kml).grid(row=0, column=0, padx=4)
+        self.btn_kml = ttk.Button(mfrm, text="Export KML", command=self.export_kml)
+        self.btn_kml.grid(row=0, column=0, padx=4)
         ttk.Button(mfrm, text="Export HTML Map", command=self.export_html).grid(row=0, column=1, padx=4)
+
+        if not SIMPLEKML_AVAILABLE:
+            self.btn_kml.state(["disabled"])
+            self.log("simplekml not installed — KML export disabled (use HTML/CSV).", lvl="info")
 
         self.worker = None
         self.queue = queue.Queue()
@@ -580,7 +570,7 @@ class App:
             verbose=self.verbose.get(),
         )
         self.worker.daemon = True
-        self.worker.start()
+               self.worker.start()
 
     def stop(self):
         if self.worker:
@@ -630,7 +620,7 @@ class App:
         # stable, friendly column order
         preferred = ["callsign", "fname", "addr1", "addr2", "city", "state", "zipcode", "country", "address", "lat", "lon"]
         present = set().union(*(r.keys() for r in self.records))
-        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
+        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred)]
         try:
             with open(p, "w", newline="", encoding="utf-8") as fh:
                 w = csv.DictWriter(fh, fieldnames=fieldnames)
@@ -642,12 +632,16 @@ class App:
             self.log(f"CSV export error: {e}", lvl="error")
 
     def export_kml(self):
+        if not SIMPLEKML_AVAILABLE:
+            messagebox.showinfo("KML unavailable", "Install 'simplekml' to enable KML export.")
+            return
         if not self.records:
             messagebox.showinfo("No data", "No results to export")
             return
         p = filedialog.asksaveasfilename(defaultextension=".kml", filetypes=[("KML", "*.kml")])
         if not p:
             return
+        import simplekml  # local import, guaranteed available here
         k = simplekml.Kml()
         for r in self.records:
             lat = r.get("lat")
@@ -765,7 +759,6 @@ class App:
         except Exception as e:
             self.log(f"HTML save error: {e}", lvl="error")
 
-
 def main():
     root = tk.Tk()
     # make the main window a bit more flexible
@@ -773,7 +766,6 @@ def main():
     root.columnconfigure(0, weight=1)
     app = App(root)
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
