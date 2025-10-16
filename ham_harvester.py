@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Ham Harvester / QRZ Mapper — Guided Flow (v3.2)
+Ham Harvester / QRZ Mapper — Guided Flow (v3.3)
 
 Flow:
 1) Modal login (QRZ XML API key OR username/password) before the main UI.
@@ -76,7 +76,7 @@ from geopy.geocoders import Nominatim as GeoNominatim  # optional; using direct 
 import simplekml
 
 # ---------- Globals ----------
-APP_AGENT = "HamHarvester/3.2"
+APP_AGENT = "HamHarvester/3.3"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_AGENT})
 
@@ -104,7 +104,21 @@ STATE_ABBR_TO_FIPS = {
     "PR":"72"
 }
 
-CALL_RE = re.compile(r"^[A-Z0-9/]{3,}$")
+# ---------- Callsign validation ----------
+# Strict US callsign validator:
+# K/N/W prefix or A[A-L] (US allocations), optional second area letter, then digit, then 1–3 letters.
+# Optional suffix like /P, /M, etc.
+CALL_RE_US = re.compile(
+    r"^(?:(?:K|N|W)[A-Z]?\d[A-Z]{1,3}|A[A-L][A-Z]?\d[A-Z]{1,3})(?:/[A-Z0-9]+)?$"
+)
+
+def is_callsign(s: str) -> bool:
+    if not s:
+        return False
+    s = s.strip().upper()
+    if len(s) < 3 or len(s) > 10:
+        return False
+    return bool(CALL_RE_US.match(s))
 
 # ---------- Utils ----------
 def now_ts():
@@ -267,7 +281,14 @@ def qrz_lookup_call(session_key, callsign, verbose=False):
     resp = HTTP.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
-    root = ET.fromstring(resp.text)
+    # Harden XML parsing to survive odd responses
+    try:
+        root = ET.fromstring(resp.text)
+    except ET.ParseError as pe:
+        if verbose:
+            print(f"[qrz_lookup_call] XML parse error for {callsign}: {pe}")
+        return None
+
     call = find_first(root, "call", "Callsign")
     if call is None:
         return None
@@ -375,6 +396,7 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
     calls = set()
     try:
         HTTP.get(FCC_BASE, timeout=30)
+
         payload = {
             "state": state_abbr,
             "county": county_name,
@@ -390,22 +412,41 @@ def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbo
         while True:
             if stopper and stopper.is_set():
                 break
+
             soup = BeautifulSoup(resp.text, "html.parser")
-            for a in soup.find_all("a"):
+
+            # Only anchors likely to be license detail links
+            anchors = soup.select('a[href*="license"], a[href*="licKey"], a[href*="licId"]')
+            for a in anchors:
                 txt = (a.get_text() or "").strip().upper()
-                if CALL_RE.match(txt):
+                if is_callsign(txt):
                     calls.add(txt)
-            nxt = soup.find("a", string=re.compile(r"Next", re.I))
-            if not nxt or not nxt.get("href"):
+
+            # Find "Next" link robustly
+            next_link = None
+            for a in soup.find_all("a"):
+                label = (a.get_text() or "").strip()
+                if re.search(r'^\s*next\b', label, re.IGNORECASE):
+                    href = a.get("href")
+                    if href:
+                        next_link = href
+                        break
+
+            if not next_link:
                 break
-            next_url = nxt.get("href")
-            if not next_url.startswith("http"):
-                next_url = requests.compat.urljoin(FCC_BASE, next_url)
-            time.sleep(polite_sleep)
-            resp = HTTP.get(next_url, timeout=30)
+
+            if not next_link.startswith("http"):
+                next_link = requests.compat.urljoin(FCC_BASE, next_link)
+
+            if polite_sleep:
+                time.sleep(polite_sleep)
+
+            resp = HTTP.get(next_link, timeout=30)
             if resp.status_code != 200:
                 break
+
         return calls
+
     except Exception as e:
         if verbose:
             print(f"[fcc_search] error for {state_abbr}/{county_name}: {e}")
@@ -458,6 +499,10 @@ class CountyHarvestWorker(StoppableThread):
             # Enrich each call
             for idx, cs in enumerate(sorted(calls), 1):
                 if self.stopped(): break
+                cs = (cs or "").strip().upper()
+                if not is_callsign(cs):
+                    self.out_q.put(("log", f"Skipping non-callsign token: {cs}"))
+                    continue
                 rec = {"callsign": cs, "county": county, "state": self.state_abbr}
                 try:
                     if self.session_key:
@@ -541,6 +586,11 @@ class CallListWorker(StoppableThread):
         for i, cs in enumerate(self.calls, 1):
             if self.stopped(): break
             try:
+                cs = (cs or "").strip().upper()
+                if not is_callsign(cs):
+                    self.out_q.put(("log", f"Skipping invalid callsign input: {cs}"))
+                    continue
+
                 info = {"callsign": cs}
                 if self.session_key:
                     q = qrz_lookup_call(self.session_key, cs, verbose=self.verbose) or {}
@@ -786,7 +836,7 @@ class App:
             self.early_logs.append(line)
             print(line)
 
-    # ---------- NEW: Robust group enable/disable ----------
+    # ---------- Robust group enable/disable ----------
     def _set_group_enabled(self, container, enabled: bool):
         """
         Safely enable/disable all interactive children in a container.
@@ -999,8 +1049,8 @@ class App:
         # dedupe/validate
         out, seen = [], set()
         for c in calls:
-            cu = c.upper()
-            if cu not in seen and CALL_RE.match(cu):
+            cu = (c or "").strip().upper()
+            if cu not in seen and is_callsign(cu):
                 seen.add(cu)
                 out.append(cu)
         return out
@@ -1017,7 +1067,7 @@ class App:
         preferred = ["callsign", "fname", "addr1", "addr2", "city", "state", "county", "zipcode",
                      "country", "address", "grid", "email", "lat", "lon"]
         present = set().union(*(r.keys() for r in self.records))
-        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
+        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred)]
         try:
             with open(p, "w", newline="", encoding="utf-8") as fh:
                 w = csv.DictWriter(fh, fieldnames=fieldnames)
