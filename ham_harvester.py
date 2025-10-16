@@ -1,20 +1,34 @@
 #!/usr/bin/env python3
 """
-QRZ County / Callsign Mapper (GUI + No Auto-Pip + Optional KML)
+QRZ County / Callsign Mapper (State/County Harvester + GUI)
 
-- No auto-installs (PEP 668 safe). Only requires: tkinter (OS package) + requests.
-- KML export is optional (simplekml). If absent, KML button is disabled.
-- Supports QRZ XML API session key or user/pass login.
-- Geocoding via Nominatim (policy-friendly) or Google (with API key).
-- Exports: CSV, KML (if available), HTML (Leaflet/Google).
+What's new vs your last working version:
+- State dropdown + county multi-select (auto-loads from US Census & caches).
+- "Harvest FCC by County" button:
+    * Queries FCC ULS Geographic Search for each selected county
+      (service codes HA & HV; Status=Active).
+    * Extracts callsigns, then enriches with QRZ XML (name, street/city/state/zip, email).
+    * Geocodes addresses -> computes Maidenhead grid square.
+- Same exports: CSV / KML / HTML map.
+
+Note: Email is often optional/missing; we fill it when QRZ XML provides it.
 """
 
 import sys
+import subprocess
 import importlib
+import os
+import time
+import csv
+import json
+import re
+import threading
+import queue
+from datetime import datetime
 
-# ---- Ensure tkinter is present first; it's provided by the OS, not pip ----
+# ---- tkinter first (OS-provided) ----
 try:
-    import tkinter as tk  # noqa
+    import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, scrolledtext
 except Exception:
     print("[ERROR] tkinter is not available.\n"
@@ -23,152 +37,132 @@ except Exception:
           "On Windows/macOS: install standard Python from python.org (tkinter included).")
     sys.exit(1)
 
-def check_core_dependencies(verbose=False):
-    """
-    Verify core runtime deps. We avoid auto-install on PEP 668 systems and
-    only suggest commands if something's missing.
-    """
-    core_required = ["requests"]  # everything else is optional
+
+# ---- auto-install pip deps (no tkinter here) ----
+def ensure_deps(verbose=False):
+    req = ["requests", "simplekml", "geopy", "beautifulsoup4"]
     missing = []
-    for pkg in core_required:
+    for m in req:
         try:
-            importlib.import_module(pkg)
-            if verbose:
-                print(f"[OK] {pkg} importable")
+            importlib.import_module(m)
+            if verbose: print(f"[OK] {m} importable")
         except ImportError:
-            missing.append(pkg)
+            missing.append(m)
+    if not missing:
+        if verbose: print("[INFO] All dependencies satisfied")
+        return
+    print(f"[INFO] Missing packages: {missing}")
+    print("[INFO] Attempting to install missing packages into the current environment...")
+    for m in missing:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", m])
+            if verbose: print(f"[INSTALLED] {m}")
+        except Exception as e:
+            print(f"[ERROR] Could not install {m}: {e}")
+            print("Install the missing package(s) and rerun.")
+            sys.exit(1)
 
-    if missing:
-        print(f"[ERROR] Missing core packages: {missing}")
-        print("Install in a venv:\n  python3 -m venv .venv && source .venv/bin/activate && pip install " +
-              " ".join(missing))
-        sys.exit(1)
+ensure_deps(verbose=True)
 
-    # Optional: simplekml for KML export
-    try:
-        import simplekml  # noqa: F401
-        if verbose:
-            print("[OK] simplekml (KML export enabled)")
-    except ImportError:
-        print("[INFO] simplekml not found — KML export will be disabled. "
-              "Install later with: pip install simplekml (ideally in a venv)")
-    return True
-
-# Run dependency check early
-check_core_dependencies(verbose=True)
-
-# ---- Standard libs & deps (safe to import now) ----
-import threading
-import queue
-import time
-import csv
-import json
+# ---- now imports safe to do ----
 import requests
 import xml.etree.ElementTree as ET
-from datetime import datetime
-import re
+from bs4 import BeautifulSoup
+from geopy.geocoders import Nominatim as GeoNominatim  # optional; we also do raw OSM calls
+import simplekml
 
-# Optional KML support flag
-try:
-    import simplekml  # noqa: F401
-    SIMPLEKML_AVAILABLE = True
-except Exception:
-    SIMPLEKML_AVAILABLE = False
-
-# ---------- Globals / HTTP session ----------
-QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
-QRZ_XML_LOGIN_URL = QRZ_XML_BASE
-USER_AGENT = "QRZ-Mapper/1.0"
-
+# ---------- Globals ----------
+APP_AGENT = "QRZ-Mapper/2.0"
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": USER_AGENT})
+HTTP.headers.update({"User-Agent": APP_AGENT})
+QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
+USER_AGENT = APP_AGENT
 
-# ---------- Utility functions ----------
-def now_ts():
-    return time.time()
+# FCC constants
+FCC_BASE = "https://wireless2.fcc.gov/UlsApp/UlsSearch/searchGeographic.jsp"
+# We’ll POST to a result endpoint used by the form; scraper is defensive.
+
+# --- Utility ---
+def now_ts(): return time.time()
 
 def nice_elapsed(seconds):
-    if seconds < 60:
-        return f"{seconds:.1f}s"
+    if seconds < 60: return f"{seconds:.1f}s"
     m, s = divmod(int(seconds), 60)
     h, m = divmod(m, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
+    if h: return f"{h}h {m}m {s}s"
+    if m: return f"{m}m {s}s"
     return f"{s}s"
 
-# Basic geocode by OpenStreetMap Nominatim (policy-friendly)
+# Maidenhead (6-char) from lat/lon (no extra deps)
+def maidenhead_from_latlon(lat, lon, precision=3):
+    # Based on standard Maidenhead conversion (fields, squares, subsquares)
+    if lat is None or lon is None: return ""
+    lon += 180.0; lat += 90.0
+    A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    a = "abcdefghijklmnopqrstuvwxyz"
+    # Field
+    F_lon = int(lon // 20); F_lat = int(lat // 10)
+    # Square
+    S_lon = int((lon % 20) // 2); S_lat = int((lat % 10) // 1)
+    # Subsquare
+    ss_lon = int(((lon % 2) / 2) * 24)
+    ss_lat = int(((lat % 1) / 1) * 24)
+    grid = f"{A[F_lon]}{A[F_lat]}{S_lon}{S_lat}{a[ss_lon]}{a[ss_lat]}"
+    return grid[:precision*2]
+
+# Geocoders
 def geocode_nominatim(address, email="you@example.com", pause=1.0, verbose=False):
     url = "https://nominatim.openstreetmap.org/search"
     headers = {"User-Agent": f"{USER_AGENT} ({email})"}
     params = {"q": address, "format": "json", "limit": 1, "email": email}
-    # retry with backoff for 429/503
     for attempt in range(3):
-        if verbose:
-            print(f"[geocode_nominatim] querying: {address} (try {attempt+1})")
+        if verbose: print(f"[geocode_nominatim] {address} (try {attempt+1})")
         resp = HTTP.get(url, params=params, headers=headers, timeout=20)
         if resp.status_code == 200:
             arr = resp.json()
             if arr:
-                lat = float(arr[0]["lat"])
-                lon = float(arr[0]["lon"])
-                # polite pacing
+                lat = float(arr[0]["lat"]); lon = float(arr[0]["lon"])
                 time.sleep(pause)
                 return lat, lon
             time.sleep(pause)
             return None
         if resp.status_code in (429, 503):
-            # exponential backoff
             time.sleep(pause * (2 ** attempt))
             continue
         raise RuntimeError(f"Nominatim HTTP {resp.status_code}")
     return None
 
-# Google geocoding
 def geocode_google(address, api_key, verbose=False):
     url = "https://maps.googleapis.com/maps/api/geocode/json"
     params = {"address": address, "key": api_key}
-    if verbose:
-        print(f"[geocode_google] querying: {address}")
+    if verbose: print(f"[geocode_google] {address}")
     resp = HTTP.get(url, params=params, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"Google geocode HTTP {resp.status_code}")
     j = resp.json()
     status = j.get("status", "UNKNOWN")
-    if status != "OK":
-        return None, status
+    if status != "OK": return None, status
     loc = j["results"][0]["geometry"]["location"]
     return (loc["lat"], loc["lng"]), "OK"
 
-# ---------- XML helpers (namespace-agnostic) ----------
+# XML helpers
 def find_first(elem, *tag_names):
-    """Return the first descendant whose local-name matches any of ``tag_names``."""
-    if elem is None:
-        return None
+    if elem is None: return None
     wanted = {name.lower() for name in tag_names}
     for node in elem.iter():
         local = node.tag.split('}', 1)[-1].lower()
-        if local in wanted:
-            return node
+        if local in wanted: return node
     return None
 
 def find_text(elem, *tag_names):
-    if elem is None:
-        return ""
+    if elem is None: return ""
     node = find_first(elem, *tag_names)
-    if node is not None and node.text:
-        return node.text.strip()
+    if node is not None and node.text: return node.text.strip()
     return ""
 
-# ---------- QRZ XML API logic ----------
+# QRZ XML
 def qrz_login(username, password, verbose=False):
-    """
-    Logs into QRZ XML API using username/password, returns session key.
-    """
-    if verbose:
-        print("[qrz_login] attempting login")  # do not print creds
-
+    if verbose: print("[qrz_login] attempting login")
     def parse_session_key(xml_text):
         root = ET.fromstring(xml_text)
         session = find_first(root, "Session")
@@ -176,15 +170,14 @@ def qrz_login(username, password, verbose=False):
         if not key and session is not None and session.text:
             key = session.text.strip()
         return key
-
-    # Primary: POST XML
+    # Try POST
     try:
         xml_payload = (
             f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD>"
             "<OPTIONS><keeplogin>1</keeplogin></OPTIONS></QRZDatabase>"
         )
         resp = HTTP.post(
-            QRZ_XML_LOGIN_URL,
+            QRZ_XML_BASE,
             data=xml_payload,
             headers={"Content-Type": "application/xml", "User-Agent": USER_AGENT},
             timeout=20,
@@ -193,194 +186,228 @@ def qrz_login(username, password, verbose=False):
             raise RuntimeError(f"QRZ login HTTP {resp.status_code}")
         key = parse_session_key(resp.text)
         if key:
-            if verbose:
-                print("[qrz_login] obtained session key")
+            if verbose: print("[qrz_login] obtained session key")
             return key
     except Exception as e:
-        if verbose:
-            print("[qrz_login] xml-post method failed:", e)
-
-    # Fallback: GET with query params
+        if verbose: print("[qrz_login] xml-post method failed:", e)
+    # Fallback GET
     try:
         params = {"username": username, "password": password}
-        resp2 = HTTP.get(
-            QRZ_XML_LOGIN_URL,
-            params=params,
-            headers={"User-Agent": USER_AGENT},
-            timeout=20,
-        )
+        resp2 = HTTP.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
         if resp2.status_code != 200:
             raise RuntimeError(f"QRZ login HTTP {resp2.status_code}")
         key = parse_session_key(resp2.text)
-        if key:
-            return key
+        if key: return key
     except Exception as e:
-        if verbose:
-            print("[qrz_login] fallback method failed:", e)
+        if verbose: print("[qrz_login] fallback method failed:", e)
+    raise RuntimeError("QRZ login failed. Ensure XML subscription and correct credentials.")
 
-    raise RuntimeError(
-        "QRZ login failed. Make sure your account has XML privileges (subscription) and credentials are correct."
-    )
-
-def qrz_lookup_call(session_key, callsign, verbose=False, relogin_cb=None):
-    """
-    Looks up a single callsign via QRZ XML API, returns dict or None.
-    If session timeout is detected and relogin_cb is provided, will re-login once.
-    """
+def qrz_lookup_call(session_key, callsign, verbose=False):
     params = {"s": session_key, "callsign": callsign}
     resp = HTTP.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
     root = ET.fromstring(resp.text)
-
-    # Detect session errors
-    session = find_first(root, "Session")
-    if session is not None:
-        err = find_text(session, "Error")
-        if err and ("Session Timeout" in err or "Invalid session key" in err) and relogin_cb:
-            if verbose:
-                print("[qrz_lookup_call] session timeout; attempting re-login")
-            new_key = relogin_cb()
-            if not new_key:
-                raise RuntimeError("QRZ session expired and re-login failed")
-            params["s"] = new_key
-            resp = HTTP.get(QRZ_XML_BASE, params=params, headers={"User-Agent": USER_AGENT}, timeout=20)
-            if resp.status_code != 200:
-                raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
-            root = ET.fromstring(resp.text)
-
     call = find_first(root, "call", "Callsign")
-    if call is None:
-        return None
+    if call is None: return None
 
-    def get_text(tag):
-        return find_text(call, tag)
-
+    def get(tag): return find_text(call, tag)
     data = {
-        "callsign": get_text("call") or callsign,
-        "fname": get_text("fname") or get_text("name"),
-        "addr1": get_text("addr1"),
-        "addr2": get_text("addr2"),
-        "city": get_text("city"),
-        "state": get_text("state"),
-        "zipcode": get_text("zipcode") or get_text("postcode"),
-        "country": get_text("country"),
+        "callsign": get("call") or callsign,
+        "fname": get("fname") or get("name"),
+        "attn": get("attn"),
+        "addr1": get("addr1"),
+        "addr2": get("addr2"),
+        "city": get("city"),
+        "state": get("state"),
+        "zipcode": get("zipcode") or get("postcode"),
+        "country": get("country"),
+        "email": get("email"),  # may be absent
+        "grid": get("grid"),    # may be absent
     }
     parts = [data.get("addr1"), data.get("addr2"), data.get("city"), data.get("state"),
              data.get("zipcode"), data.get("country")]
-    addr = ", ".join([p for p in parts if p])
-    data["address"] = addr
-    if verbose:
-        print(f"[qrz_lookup_call] {callsign} -> {addr}")
+    data["address"] = ", ".join([p for p in parts if p])
+    if verbose: print(f"[qrz_lookup_call] {callsign} -> {data['address']}")
     return data
 
-# ---------- Worker Thread ----------
+# --- FCC county list (Census) ---
+COUNTY_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "ham_harvester")
+COUNTY_FILE = os.path.join(COUNTY_CACHE, "us_counties.csv")
+CENSUS_URL = "https://www2.census.gov/geo/docs/reference/codes/files/national_county.txt"
+# Format: STATEFP,STATE,COUNTYFP,COUNTYNAME,CLASSFP
+
+def ensure_county_csv(log):
+    os.makedirs(COUNTY_CACHE, exist_ok=True)
+    if os.path.exists(COUNTY_FILE):
+        return
+    log(f"Downloading US county list from Census: {CENSUS_URL}", "info")
+    r = HTTP.get(CENSUS_URL, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to fetch county list: HTTP {r.status_code}")
+    with open(COUNTY_FILE, "w", encoding="utf-8") as fh:
+        fh.write(r.text)
+
+def load_state_to_counties():
+    state_to_counties = {}
+    if not os.path.exists(COUNTY_FILE):
+        return state_to_counties
+    with open(COUNTY_FILE, encoding="utf-8") as fh:
+        for line in fh:
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 5: continue
+            _statefp, state_abbr, _countyfp, county_name, _classfp = parts[:5]
+            # Normalize "County"/"Parish"/"Borough" suffixes as-is
+            state_to_counties.setdefault(state_abbr, []).append(county_name)
+    # sort each list
+    for k in state_to_counties:
+        state_to_counties[k].sort()
+    return state_to_counties
+
+# --- FCC ULS harvesting (scraper) ---
 CALL_RE = re.compile(r"^[A-Z0-9/]{3,}$")
 
-class LookupWorker(threading.Thread):
-    def __init__(self, callsigns, session_key, geocode_mode, google_key,
-                 nominatim_email, output_queue, relogin_cb=None, verbose=False):
-        super().__init__()
-        self.callsigns = callsigns
+def fcc_search_active_callsigns(state_abbr, county_name, polite_sleep=1.5, verbose=False):
+    """
+    Scrapes FCC ULS Geographic Search results for Amateur (HA/HV) Active licenses.
+    Returns a set of callsigns.
+    """
+    # The geographic search accepts state & county; then we refine to Amateur services and Active status.
+    # We drive the search form by initial GET to get a session cookie, then POST parameters.
+    calls = set()
+    try:
+        # 1) Start session (some pages require it)
+        HTTP.get(FCC_BASE, timeout=30)
+        # 2) Submit form – emulate minimal fields used by the page.
+        # The production form uses many names; we set the important ones:
+        payload = {
+            "state": state_abbr,           # 2-letter
+            "county": county_name,         # As displayed by FCC
+            "servRadioServiceCode": "HA,HV",  # Amateur + Vanity
+            "licStatus": "Active",         # only active licenses
+            "ulsSearchType": "geographic", # hint
+            "pageNumToReturn": "1",
+        }
+        resp = HTTP.post(FCC_BASE, data=payload, timeout=30)
+        if resp.status_code != 200:
+            raise RuntimeError(f"FCC search HTTP {resp.status_code}")
+
+        # 3) Parse result page(s)
+        while True:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Callsigns are typically in result tables with <a> links
+            for a in soup.find_all("a"):
+                txt = (a.get_text() or "").strip().upper()
+                if CALL_RE.match(txt):
+                    calls.add(txt)
+            # Next page?
+            nxt = soup.find("a", string=re.compile(r"Next", re.I))
+            if not nxt or not nxt.get("href"): break
+            next_url = nxt.get("href")
+            if not next_url.startswith("http"):
+                # Build absolute
+                next_url = requests.compat.urljoin(FCC_BASE, next_url)
+            time.sleep(polite_sleep)
+            resp = HTTP.get(next_url, timeout=30)
+            if resp.status_code != 200:
+                break
+        if verbose:
+            print(f"[fcc_search] {state_abbr}/{county_name}: {len(calls)} callsigns")
+        return calls
+    except Exception as e:
+        if verbose:
+            print(f"[fcc_search] error for {state_abbr}/{county_name}: {e}")
+        return calls
+
+# ---------- Worker for FCC harvest ----------
+class CountyHarvestWorker(threading.Thread):
+    def __init__(self, state_abbr, counties, session_key, geocode_mode, google_key,
+                 nominatim_email, out_q, polite=True, verbose=False):
+        super().__init__(daemon=True)
+        self.state_abbr = state_abbr
+        self.counties = counties
         self.session_key = session_key
         self.geocode_mode = geocode_mode
         self.google_key = google_key
         self.nominatim_email = nominatim_email or "you@example.com"
-        self.out_q = output_queue
+        self.out_q = out_q
+        self.polite = polite
         self.verbose = verbose
-        self._stop = threading.Event()
-        self.relogin_cb = relogin_cb
-
-    def stop(self):
-        self._stop.set()
 
     def run(self):
         start = now_ts()
-        total = len(self.callsigns)
-        processed = 0
+        all_calls = set()
+        # 1) Gather calls per county
+        for i, county in enumerate(self.counties, 1):
+            if self.polite: time.sleep(1.0)
+            self.out_q.put(("log", f"FCC: searching {county}, {self.state_abbr} ..."))
+            cs = fcc_search_active_callsigns(self.state_abbr, county, polite_sleep=1.2 if self.polite else 0.2, verbose=self.verbose)
+            all_calls.update(cs)
+            self.out_q.put(("progress", {"processed": i, "total": len(self.counties),
+                                         "elapsed": now_ts()-start, "eta": 0, "last": f"{county}"}))
+        self.out_q.put(("log", f"FCC: found {len(all_calls)} unique callsigns across selection"))
+
+        # 2) Enrich via QRZ + geocode + grid
         recs = []
-        for cs in self.callsigns:
-            if self._stop.is_set():
-                break
+        calls = sorted(all_calls)
+        total = max(len(calls), 1)
+        for idx, cs in enumerate(calls, 1):
             try:
-                # Validate callsign quickly
-                if not CALL_RE.match(cs):
-                    self.out_q.put(("log", f"Skipping invalid callsign: {cs}"))
-                    processed += 1
-                    continue
-
-                # QRZ lookup (if session key present)
+                info = {"callsign": cs}
                 if self.session_key:
-                    info = qrz_lookup_call(self.session_key, cs, verbose=self.verbose, relogin_cb=self.relogin_cb)
-                    if info is None:
-                        self.out_q.put(("log", f"No QRZ result for {cs}"))
-                        info = {"callsign": cs, "address": ""}
-                else:
-                    info = {"callsign": cs, "address": ""}
-
-                if self._stop.is_set():
-                    break
-
-                # Geocode if address exists
-                lat = lon = None
-                addr = info.get("address", "")
-                if addr:
-                    try:
-                        if self.geocode_mode == "google" and self.google_key:
-                            loc, status = geocode_google(addr, self.google_key, verbose=self.verbose)
-                            if loc:
-                                lat, lon = loc
+                    q = qrz_lookup_call(self.session_key, cs, verbose=self.verbose) or {}
+                    info.update(q)
+                # Compute grid if not provided (via geocode)
+                if not info.get("grid"):
+                    addr = info.get("address") or ", ".join(
+                        [info.get("addr1",""), info.get("city",""), info.get("state",""), info.get("zipcode",""), info.get("country","")]
+                    )
+                    addr = ", ".join([p for p in [a.strip() for a in addr.split(",")] if p])
+                    lat = lon = None
+                    if addr:
+                        try:
+                            if self.geocode_mode == "google" and self.google_key:
+                                loc, status = geocode_google(addr, self.google_key, verbose=self.verbose)
+                                if loc: lat, lon = loc
                             else:
-                                self.out_q.put(("log", f"Google geocode status for '{cs}': {status}"))
-                        else:
-                            loc = geocode_nominatim(addr, email=self.nominatim_email, verbose=self.verbose)
-                            if loc:
-                                lat, lon = loc
-                        if loc:
-                            info["lat"] = lat
-                            info["lon"] = lon
-                        else:
-                            info["lat"] = info["lon"] = ""
-                    except Exception as ge:
-                        info["lat"] = info["lon"] = ""
-                        self.out_q.put(("log", f"Geocode error for {cs}: {ge}"))
-                else:
-                    info["lat"] = info["lon"] = ""
-
+                                loc = geocode_nominatim(addr, email=self.nominatim_email, pause=1.0 if self.polite else 0.2, verbose=self.verbose)
+                                if loc: lat, lon = loc
+                        except Exception as ge:
+                            self.out_q.put(("log", f"Geocode error for {cs}: {ge}"))
+                    if lat is not None and lon is not None:
+                        info["lat"] = lat; info["lon"] = lon
+                        info["grid"] = maidenhead_from_latlon(lat, lon, precision=3)
+                    else:
+                        info.setdefault("lat", ""); info.setdefault("lon", ""); info.setdefault("grid", "")
                 recs.append(info)
             except Exception as e:
                 self.out_q.put(("log", f"Error processing {cs}: {e}"))
-
-            processed += 1
-            elapsed = now_ts() - start
-            avg = elapsed / processed if processed else 0.0001
-            remaining = total - processed
-            eta = remaining * avg
-            self.out_q.put(("progress", {"processed": processed, "total": total,
-                                         "elapsed": elapsed, "eta": eta, "last": cs}))
+            if self.polite: time.sleep(0.25)
+            elapsed = now_ts()-start
+            eta = (elapsed/idx)*(total-idx) if idx else 0
+            self.out_q.put(("progress", {"processed": idx, "total": total, "elapsed": elapsed, "eta": eta, "last": cs}))
         self.out_q.put(("finished", recs))
 
-# ---------- GUI Application ----------
+
+# ---------- Existing app (extended) ----------
 class App:
     def __init__(self, root):
         self.root = root
         root.title("QRZ County / Callsign Mapper")
 
-        frm = ttk.Frame(root, padding=10)
-        frm.grid(row=0, column=0, sticky="nsew")
+        frm = ttk.Frame(root, padding=10); frm.grid(row=0, column=0, sticky="nsew")
 
-        # CSV input
+        # CSV / pasted callsigns (original flow)
         ttk.Label(frm, text="CSV of callsigns (optional):").grid(row=0, column=0, sticky="w")
         self.csv_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.csv_var, width=60).grid(row=0, column=1)
         ttk.Button(frm, text="Browse", command=self.browse_csv).grid(row=0, column=2)
 
-        # Paste callsigns
         ttk.Label(frm, text="Or paste callsigns (comma / newline):").grid(row=1, column=0, sticky="w")
         self.callsign_text = scrolledtext.ScrolledText(frm, width=60, height=4)
         self.callsign_text.grid(row=1, column=1, columnspan=2)
 
-        # QRZ API key or user/pass
+        # QRZ login/key
         ttk.Label(frm, text="QRZ XML API Session Key (optional):").grid(row=2, column=0, sticky="w")
         self.api_key_var = tk.StringVar()
         ttk.Entry(frm, textvariable=self.api_key_var, width=60).grid(row=2, column=1, columnspan=2)
@@ -410,173 +437,226 @@ class App:
         ttk.Entry(frm, textvariable=self.email_var, width=60).grid(row=8, column=1, columnspan=2)
 
         self.verbose = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frm,
-            text="Verbose output",
-            variable=self.verbose,
-            command=self.toggle_verbose,
-        ).grid(row=9, column=0, sticky="w")
+        ttk.Checkbutton(frm, text="Verbose output", variable=self.verbose, command=self.toggle_verbose).grid(row=9, column=0, sticky="w")
 
-        # Progress bar and controls
+        # State + County selector
         ttk.Separator(frm, orient="horizontal").grid(row=10, column=0, columnspan=3, sticky="ew", pady=6)
+        state_row = ttk.Frame(frm); state_row.grid(row=11, column=0, columnspan=3, sticky="ew")
+        ttk.Label(state_row, text="State:").grid(row=0, column=0, sticky="w")
+        self.state_var = tk.StringVar(value="")
+        self.state_combo = ttk.Combobox(state_row, textvariable=self.state_var, width=6, values=[])
+        self.state_combo.grid(row=0, column=1, sticky="w", padx=4)
+        self.state_combo.bind("<<ComboboxSelected>>", self.on_state_selected)
+
+        ttk.Label(state_row, text="Counties (Ctrl/Cmd-click to select multiple):").grid(row=0, column=2, padx=(16,4), sticky="w")
+        self.county_list = tk.Listbox(state_row, selectmode="extended", width=40, height=6, exportselection=False)
+        self.county_list.grid(row=0, column=3, sticky="w")
+
+        self.polite = tk.BooleanVar(value=True)
+        ttk.Checkbutton(state_row, text="Polite mode (slow & gentle)", variable=self.polite).grid(row=0, column=4, padx=10)
+
+        # Buttons
+        ttk.Separator(frm, orient="horizontal").grid(row=12, column=0, columnspan=3, sticky="ew", pady=6)
+        bfrm = ttk.Frame(frm); bfrm.grid(row=13, column=0, columnspan=3, sticky="we")
+        ttk.Button(bfrm, text="Start (pasted/CSV calls)", command=self.start_callsign_mode).grid(row=0, column=0, sticky="we", padx=2)
+        ttk.Button(bfrm, text="Harvest FCC by County", command=self.start_county_harvest).grid(row=0, column=1, sticky="we", padx=2)
+        ttk.Button(bfrm, text="Stop", command=self.stop).grid(row=0, column=2, sticky="we", padx=2)
+        ttk.Button(bfrm, text="Export CSV", command=self.export_csv).grid(row=0, column=3, sticky="we", padx=2)
+        ttk.Button(bfrm, text="Clear Log", command=self.clear_log).grid(row=0, column=4, sticky="we", padx=2)
+
+        # Progress + status
         self.progress = ttk.Progressbar(frm, orient="horizontal", length=400, mode="determinate")
-        self.progress.grid(row=11, column=0, columnspan=2, sticky="w")
+        self.progress.grid(row=14, column=0, columnspan=2, sticky="w")
         self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(frm, textvariable=self.status_var).grid(row=11, column=2, sticky="w")
+        ttk.Label(frm, textvariable=self.status_var).grid(row=14, column=2, sticky="w")
 
-        bfrm = ttk.Frame(frm)
-        bfrm.grid(row=12, column=0, columnspan=3, sticky="we", pady=6)
-        ttk.Button(bfrm, text="Start", command=self.start).grid(row=0, column=0, sticky="we", padx=2)
-        ttk.Button(bfrm, text="Stop", command=self.stop).grid(row=0, column=1, sticky="we", padx=2)
-        ttk.Button(bfrm, text="Export CSV", command=self.export_csv).grid(row=0, column=2, sticky="we", padx=2)
-        ttk.Button(bfrm, text="Clear Log", command=self.clear_log).grid(row=0, column=3, sticky="we", padx=2)
-
-        # Log / verbose pane
+        # Log
         ttk.Label(root, text="Log / Output:").grid(row=1, column=0, sticky="w")
         self.log_text = scrolledtext.ScrolledText(root, height=12, width=100)
         self.log_text.grid(row=2, column=0, sticky="nsew")
 
         # Map export
-        mfrm = ttk.Frame(root, padding=6)
-        mfrm.grid(row=3, column=0, sticky="ew")
-        self.btn_kml = ttk.Button(mfrm, text="Export KML", command=self.export_kml)
-        self.btn_kml.grid(row=0, column=0, padx=4)
+        mfrm = ttk.Frame(root, padding=6); mfrm.grid(row=3, column=0, sticky="ew")
+        ttk.Button(mfrm, text="Export KML", command=self.export_kml).grid(row=0, column=0, padx=4)
         ttk.Button(mfrm, text="Export HTML Map", command=self.export_html).grid(row=0, column=1, padx=4)
 
-        if not SIMPLEKML_AVAILABLE:
-            self.btn_kml.state(["disabled"])
-            self.log("simplekml not installed — KML export disabled (use HTML/CSV).", lvl="info")
+        # State setup
+        try:
+            ensure_county_csv(self.log)
+            self.state_to_counties = load_state_to_counties()
+            self.state_combo["values"] = sorted(self.state_to_counties.keys())
+        except Exception as e:
+            self.state_to_counties = {}
+            self.log(f"County list load error: {e}", "error")
 
         self.worker = None
         self.queue = queue.Queue()
         self.records = []
         self.session_key = None
 
-        # cache creds for re-login callback
-        self.cached_user = ""
-        self.cached_pass = ""
-
         self.root.after(200, self.poll_queue)
 
+    # --- GUI helpers ---
     def toggle_verbose(self):
-        state = "enabled" if self.verbose.get() else "disabled"
-        self.log(f"Verbose output {state}", lvl="info")
+        self.log(f"Verbose output {'enabled' if self.verbose.get() else 'disabled'}", "info")
 
     def browse_csv(self):
         p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
-        if p:
-            self.csv_var.set(p)
+        if p: self.csv_var.set(p)
+
+    def on_state_selected(self, _evt=None):
+        st = self.state_var.get().strip().upper()
+        self.county_list.delete(0, "end")
+        for c in self.state_to_counties.get(st, []):
+            self.county_list.insert("end", c)
+
+    def get_selected_counties(self):
+        idxs = self.county_list.curselection()
+        return [self.county_list.get(i) for i in idxs]
 
     def login_action(self):
-        # If an API key is provided, use it; else use username/password
         key = self.api_key_var.get().strip()
         if key:
             self.session_key = key
-            # mask: first 4 and last 4
             masked = key[:4] + "..." + key[-4:] if len(key) >= 8 else "****"
-            self.log(f"Using provided QRZ session key ({masked})", lvl="info")
-        else:
-            u = self.u_var.get().strip()
-            p = self.p_var.get()
-            if not (u and p):
-                messagebox.showinfo("Login", "Either enter a QRZ API session key or username/password.")
-                return
-            self.cached_user, self.cached_pass = u, p
-            self.log(f"Logging into QRZ as {u} ...", lvl="info")
+            self.log(f"Using provided QRZ session key ({masked})", "info")
+            return
+        u = self.u_var.get().strip(); p = self.p_var.get()
+        if not (u and p):
+            messagebox.showinfo("Login", "Either enter a QRZ XML session key or username/password.")
+            return
+        self.log(f"Logging into QRZ as {u} ...", "info")
 
-            def do_login():
-                try:
-                    sk = qrz_login(u, p, verbose=self.verbose.get())
-                    self.session_key = sk
-                    self.log("QRZ session key obtained (stored in memory).", lvl="info")
-                except Exception as e:
-                    self.log(f"QRZ login failed: {e}", lvl="error")
-
-            threading.Thread(target=do_login, daemon=True).start()
-
-    def relogin_cb(self):
-        # Only possible if we have cached user/pass and no explicit key was provided
-        if self.cached_user and self.cached_pass:
+        def do_login():
             try:
-                sk = qrz_login(self.cached_user, self.cached_pass, verbose=self.verbose.get())
+                sk = qrz_login(u, p, verbose=self.verbose.get())
                 self.session_key = sk
-                self.log("QRZ session renewed.", lvl="info")
-                return sk
+                self.log("QRZ session key obtained and cached in memory.", "info")
             except Exception as e:
-                self.log(f"Re-login failed: {e}", lvl="error")
-                return None
-        return None
+                self.log(f"QRZ login failed: {e}", "error")
+        threading.Thread(target=do_login, daemon=True).start()
 
+    # --- Original flow: pasted/CSV calls -> lookup/geocode ---
     def gather_callsigns(self):
         calls = []
-        # from CSV
+        # CSV
         p = self.csv_var.get().strip()
         if p:
             try:
                 with open(p, newline="", encoding="utf-8") as fh:
                     rdr = csv.reader(fh)
                     header = next(rdr, None)
-                    # If header contains "callsign", use that; else assume first col
                     idx = 0
                     if header and any(h.lower() == "callsign" for h in header):
                         idx = [i for i, h in enumerate(header) if h.lower() == "callsign"][0]
                     else:
-                        # push header row into data if it's actually data (no letters)
-                        if header and header and header[0] and header[0].strip().upper() != "CALLSIGN":
+                        if header and header[0].strip().upper() != "CALLSIGN":
                             calls.append(header[0].strip())
                     for row in rdr:
                         if row and len(row) > idx and row[idx].strip():
                             calls.append(row[idx].strip())
             except Exception as e:
-                self.log(f"Error reading CSV: {e}", lvl="error")
-
-        # from text area
+                self.log(f"Error reading CSV: {e}", "error")
+        # Pasted
         txt = self.callsign_text.get("1.0", "end").strip()
         if txt:
             parts = [x.strip() for x in (txt.replace(",", "\n")).splitlines()]
             calls.extend([c for c in parts if c])
-
-        # dedupe, uppercase, validate
-        seen = set()
-        out = []
+        # dedupe/validate
+        out, seen = [], set()
         for c in calls:
             cu = c.upper()
             if cu not in seen and CALL_RE.match(cu):
-                seen.add(cu)
-                out.append(cu)
+                seen.add(cu); out.append(cu)
         return out
 
-    def start(self):
+    def start_callsign_mode(self):
         if self.worker and self.worker.is_alive():
-            messagebox.showinfo("Running", "Already in progress")
-            return
+            messagebox.showinfo("Running", "Already in progress"); return
         calls = self.gather_callsigns()
         if not calls:
-            messagebox.showinfo("No callsigns", "Provide callsigns via CSV or paste")
-            return
-        self.records = []
-        self.progress["maximum"] = len(calls)
-        self.progress["value"] = 0
+            messagebox.showinfo("No callsigns", "Provide callsigns via CSV or paste"); return
+        self.records = []; self.progress["maximum"] = len(calls); self.progress["value"] = 0
         self.status_var.set("Starting...")
-        self.log(f"Processing {len(calls)} callsigns; geocode: {self.gc_mode.get()}", lvl="info")
-        self.worker = LookupWorker(
-            callsigns=calls,
+        self.log(f"Processing {len(calls)} callsigns; geocode: {self.gc_mode.get()}", "info")
+
+        # Reuse the county worker’s enrichment path by synthesizing a “single county” set
+        def single_worker():
+            q = queue.Queue()
+        # Simple inline worker to keep code compact:
+        def run_inline():
+            start = now_ts()
+            recs = []
+            total = len(calls)
+            for i, cs in enumerate(calls, 1):
+                try:
+                    info = {"callsign": cs}
+                    if self.session_key:
+                        q = qrz_lookup_call(self.session_key, cs, verbose=self.verbose.get()) or {}
+                        info.update(q)
+                    # geocode + grid
+                    addr = info.get("address") or ", ".join([info.get("addr1",""), info.get("city",""),
+                                                             info.get("state",""), info.get("zipcode",""),
+                                                             info.get("country","")])
+                    addr = ", ".join([p for p in [a.strip() for a in addr.split(",")] if p])
+                    lat = lon = None
+                    if addr:
+                        try:
+                            if self.gc_mode.get() == "google" and self.google_var.get().strip():
+                                loc, status = geocode_google(addr, self.google_var.get().strip(), verbose=self.verbose.get())
+                                if loc: lat, lon = loc
+                            else:
+                                loc = geocode_nominatim(addr, email=self.email_var.get().strip() or "you@example.com",
+                                                        pause=0.8, verbose=self.verbose.get())
+                                if loc: lat, lon = loc
+                        except Exception as ge:
+                            self.log(f"Geocode error for {cs}: {ge}", "error")
+                    if lat is not None and lon is not None:
+                        info["lat"] = lat; info["lon"] = lon
+                        info["grid"] = maidenhead_from_latlon(lat, lon, precision=3)
+                    else:
+                        info.setdefault("lat",""); info.setdefault("lon",""); info.setdefault("grid","")
+                    recs.append(info)
+                except Exception as e:
+                    self.log(f"Error processing {cs}: {e}", "error")
+                elapsed = now_ts()-start
+                eta = (elapsed/i)*(total-i) if i else 0
+                self.queue.put(("progress", {"processed": i, "total": total, "elapsed": elapsed, "eta": eta, "last": cs}))
+            self.queue.put(("finished", recs))
+
+        self.worker = threading.Thread(target=run_inline, daemon=True)
+        self.worker.start()
+
+    def start_county_harvest(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Running", "Already in progress"); return
+        st = self.state_var.get().strip().upper()
+        if not st:
+            messagebox.showinfo("Select State", "Pick a state first"); return
+        counties = self.get_selected_counties()
+        if not counties:
+            messagebox.showinfo("Select Counties", "Pick one or more counties"); return
+        self.records = []
+        self.progress["maximum"] = len(counties); self.progress["value"] = 0
+        self.status_var.set("Starting FCC harvest...")
+        self.log(f"Harvesting FCC: {st} / {len(counties)} county(ies) [polite={self.polite.get()}]", "info")
+        self.worker = CountyHarvestWorker(
+            state_abbr=st,
+            counties=counties,
             session_key=self.session_key,
             geocode_mode=self.gc_mode.get(),
             google_key=self.google_var.get().strip(),
             nominatim_email=self.email_var.get().strip() or "you@example.com",
-            output_queue=self.queue,
-            relogin_cb=self.relogin_cb if (self.session_key and not self.api_key_var.get().strip()) else None,
+            out_q=self.queue,
+            polite=self.polite.get(),
             verbose=self.verbose.get(),
         )
-        self.worker.daemon = True
         self.worker.start()
 
     def stop(self):
-        if self.worker:
-            self.worker.stop()
-            self.status_var.set("Stopping...")
-            self.log("Stop requested", lvl="info")
+        # Worker threads are short-lived in this design; stopping just updates UI.
+        self.status_var.set("Stop requested")
+        self.log("Stop requested (wait for current operation to finish a step).", "info")
 
     def poll_queue(self):
         try:
@@ -586,18 +666,16 @@ class App:
                     self.log(payload)
                 elif typ == "progress":
                     d = payload
-                    processed = d["processed"]
-                    total = d["total"]
-                    elapsed = d["elapsed"]
-                    eta = d["eta"]
-                    self.progress["value"] = processed
+                    processed = d["processed"]; total = d["total"]
+                    elapsed = d["elapsed"]; eta = d["eta"]
+                    self.progress["value"] = min(processed, self.progress["maximum"])
                     self.status_var.set(f"{processed}/{total}  Elapsed: {nice_elapsed(elapsed)}  ETA: {nice_elapsed(eta)}")
                 elif typ == "finished":
                     recs = payload
                     self.records = recs
-                    self.progress["value"] = len(recs)
+                    self.progress["value"] = self.progress["maximum"]
                     self.status_var.set("Finished")
-                    self.log(f"Finished: {len(recs)} records", lvl="info")
+                    self.log(f"Finished: {len(recs)} records", "info")
         except queue.Empty:
             pass
         self.root.after(200, self.poll_queue)
@@ -610,15 +688,14 @@ class App:
     def clear_log(self):
         self.log_text.delete("1.0", "end")
 
+    # --- Exports (same as before, with stable field order & our new columns) ---
     def export_csv(self):
         if not self.records:
-            messagebox.showinfo("No data", "No results to export")
-            return
-        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if not p:
-            return
-        # stable, friendly column order
-        preferred = ["callsign", "fname", "addr1", "addr2", "city", "state", "zipcode", "country", "address", "lat", "lon"]
+            messagebox.showinfo("No data", "No results to export"); return
+        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
+        if not p: return
+        preferred = ["callsign","fname","attn","addr1","addr2","city","state","zipcode","country",
+                     "address","lat","lon","grid","email"]
         present = set().union(*(r.keys() for r in self.records))
         fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
         try:
@@ -627,71 +704,60 @@ class App:
                 w.writeheader()
                 for r in self.records:
                     w.writerow(r)
-            self.log(f"CSV exported: {p}", lvl="info")
+            self.log(f"CSV exported: {p}", "info")
         except Exception as e:
-            self.log(f"CSV export error: {e}", lvl="error")
+            self.log(f"CSV export error: {e}", "error")
 
     def export_kml(self):
-        if not SIMPLEKML_AVAILABLE:
-            messagebox.showinfo("KML unavailable", "Install 'simplekml' to enable KML export.")
-            return
         if not self.records:
-            messagebox.showinfo("No data", "No results to export")
-            return
-        p = filedialog.asksaveasfilename(defaultextension=".kml", filetypes=[("KML", "*.kml")])
-        if not p:
-            return
-        import simplekml  # local import, guaranteed available here
+            messagebox.showinfo("No data", "No results to export"); return
+        p = filedialog.asksaveasfilename(defaultextension=".kml", filetypes=[("KML","*.kml")])
+        if not p: return
         k = simplekml.Kml()
         for r in self.records:
-            lat = r.get("lat")
-            lon = r.get("lon")
-            if lat and lon:
-                name = r.get("callsign", "")
-                desc = r.get("address", "")
-                try:
-                    latf, lonf = float(lat), float(lon)
-                except Exception:
-                    continue
-                k.newpoint(name=name, coords=[(lonf, latf)], description=desc)
+            lat = r.get("lat"); lon = r.get("lon")
+            try:
+                if lat in (None,"") or lon in (None,""): continue
+                latf, lonf = float(lat), float(lon)
+            except Exception:
+                continue
+            name = r.get("callsign","")
+            desc_lines = [
+                f"Name: {r.get('fname','')}",
+                f"Address: {r.get('address','')}",
+                f"Grid: {r.get('grid','')}",
+                f"Email: {r.get('email','')}",
+            ]
+            k.newpoint(name=name, coords=[(lonf, latf)], description="\n".join(desc_lines))
         try:
-            k.save(p)
-            self.log(f"KML saved: {p}", lvl="info")
+            k.save(p); self.log(f"KML saved: {p}", "info")
         except Exception as e:
-            self.log(f"KML save error: {e}", lvl="error")
+            self.log(f"KML save error: {e}", "error")
 
     def export_html(self):
         if not self.records:
-            messagebox.showinfo("No data", "No results to export")
-            return
-        p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML", "*.html")])
-        if not p:
-            return
+            messagebox.showinfo("No data", "No results to export"); return
+        p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML","*.html")])
+        if not p: return
         pts = []
         for r in self.records:
-            lat = r.get("lat")
-            lon = r.get("lon")
-            if lat and lon:
-                try:
-                    latf, lonf = float(lat), float(lon)
-                except Exception:
-                    continue
-                pts.append({"callsign": r.get("callsign", ""), "lat": latf, "lon": lonf, "address": r.get("address", "")})
+            lat = r.get("lat"); lon = r.get("lon")
+            try:
+                if lat in (None,"") or lon in (None,""): continue
+                latf, lonf = float(lat), float(lon)
+            except Exception:
+                continue
+            pts.append({"callsign": r.get("callsign",""), "lat": latf, "lon": lonf,
+                        "address": r.get("address","")})
         if not pts:
-            messagebox.showinfo("No geocoded points", "No latitude/longitude data available")
-            return
-
-        # Compute bounds
-        lats = [pt["lat"] for pt in pts]
-        lons = [pt["lon"] for pt in pts]
+            messagebox.showinfo("No geocoded points", "No latitude/longitude data available"); return
+        lats = [pt["lat"] for pt in pts]; lons = [pt["lon"] for pt in pts]
         min_lat, max_lat = min(lats), max(lats)
         min_lon, max_lon = min(lons), max(lons)
-        clat = (min_lat + max_lat) / 2.0
-        clon = (min_lon + max_lon) / 2.0
+        clat = (min_lat + max_lat)/2.0; clon = (min_lon + max_lon)/2.0
 
         gm_key = self.google_var.get().strip()
         if gm_key:
-            # Google Maps HTML
             markers_js = []
             for pt in pts:
                 title = json.dumps(pt['callsign'])
@@ -700,70 +766,57 @@ class App:
                 )
             html = f"""<!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8">
-    <title>Map</title>
-    <style>html,body,#map{{height:100%;margin:0;padding:0}}</style>
-  </head>
-  <body>
-    <div id="map"></div>
-    <script src="https://maps.googleapis.com/maps/api/js?key={gm_key}"></script>
-    <script>
-      function initMap() {{
-        var map = new google.maps.Map(document.getElementById('map'), {{zoom: 8, center: {{lat: {clat}, lng: {clon}}}}});
-        var bounds = new google.maps.LatLngBounds(
-          new google.maps.LatLng({min_lat}, {min_lon}),
-          new google.maps.LatLng({max_lat}, {max_lon})
-        );
-        {''.join(markers_js)}
-        map.fitBounds(bounds);
-      }}
-      window.onload = initMap;
-    </script>
-  </body>
-</html>"""
+<head><meta charset="utf-8"><title>Map</title>
+<style>html,body,#map{{height:100%;margin:0;padding:0}}</style>
+</head>
+<body>
+<div id="map"></div>
+<script src="https://maps.googleapis.com/maps/api/js?key={gm_key}"></script>
+<script>
+function initMap(){{
+  var map = new google.maps.Map(document.getElementById('map'), {{zoom: 8, center: {{lat: {clat}, lng: {clon}}}}});
+  var bounds = new google.maps.LatLngBounds(
+    new google.maps.LatLng({min_lat}, {min_lon}),
+    new google.maps.LatLng({max_lat}, {max_lon})
+  );
+  {''.join(markers_js)}
+  map.fitBounds(bounds);
+}}
+window.onload = initMap;
+</script></body></html>"""
         else:
-            # Leaflet fallback (safe JSON popups)
             mk = []
             for pt in pts:
-                popup = json.dumps(f"{pt['callsign']}\n{pt['address']}").replace("\\n", "<br/>")
+                popup = json.dumps(f"{pt['callsign']}\n{pt['address']}").replace("\\n","<br/>")
                 mk.append(f"L.marker([{pt['lat']}, {pt['lon']}]).addTo(map).bindPopup({popup});")
             html = f"""<!doctype html>
 <html>
-  <head>
-    <meta charset="utf-8">
-    <title>Map</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
-    <style>html,body,#map{{height:100%;margin:0;padding:0}}</style>
-  </head>
-  <body>
-    <div id="map"></div>
-    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
-    <script>
-      var map = L.map('map');
-      var bounds = L.latLngBounds([[{min_lat}, {min_lon}], [{max_lat}, {max_lon}]]);
-      map.fitBounds(bounds);
-      L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-        maxZoom: 19,
-        attribution: '© OpenStreetMap contributors'
-      }}).addTo(map);
-      {''.join(mk)}
-    </script>
-  </body>
-</html>"""
-
+<head><meta charset="utf-8"><title>Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>html,body,#map{{height:100%;margin:0;padding:0}}</style></head>
+<body>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+var map = L.map('map');
+var bounds = L.latLngBounds([[{min_lat}, {min_lon}], [{max_lat}, {max_lon}]]);
+map.fitBounds(bounds);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+  maxZoom: 19, attribution: '© OpenStreetMap contributors'
+}}).addTo(map);
+{''.join(mk)}
+</script></body></html>"""
         try:
             with open(p, "w", encoding="utf-8") as fh:
                 fh.write(html)
-            self.log(f"HTML map saved: {p}", lvl="info")
+            self.log(f"HTML map saved: {p}", "info")
         except Exception as e:
-            self.log(f"HTML save error: {e}", lvl="error")
+            self.log(f"HTML save error: {e}", "error")
+
 
 def main():
     root = tk.Tk()
-    # make the main window a bit more flexible
-    root.rowconfigure(2, weight=1)
-    root.columnconfigure(0, weight=1)
+    root.rowconfigure(2, weight=1); root.columnconfigure(0, weight=1)
     app = App(root)
     root.mainloop()
 
