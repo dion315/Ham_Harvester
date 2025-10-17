@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Ham Harvester (QRZ-only mode while FCC ULS is offline)
+Ham Harvester — QRZ county harvester (public website discovery) + QRZ XML enrich
 
-What this build does:
-- Prompt-first QRZ login/API key (required to proceed)
-- Mode: Callsign(s) only (paste or CSV) -> Lookup via QRZ XML API
-- CSV export fields: callsign, name, addr1, addr2, city, state, county (best-effort), zip, grid, email, lat, lon, address
-- Map export: KML, HTML (Leaflet or Google if API key provided)
-- Verbose logging, progress/ETA, Stop button
-- County/State UI present but disabled with explanatory text (no QRZ XML bulk-by-county)
+What it does
+------------
+1) Prompt-first QRZ login or XML session key (required for detail enrichment).
+2) Mode A: Callsigns/CSV -> QRZ XML lookup -> optional geocode -> export CSV/KML/HTML map.
+3) Mode B: State/County -> Scrape ALL calls from QRZ public "Advanced Search" results:
+     - discovers the live Advanced Search form (finds field names for state/county/status),
+       submits for each selected county with status=Active, paginates & collects calls.
+     - enrich every callsign via QRZ XML (name/street/city/state/county/zip/grid/email).
+4) Verbose logging, progress/ETA, Stop button.
 
-Why no County/State harvesting now?
-- QRZ XML API spec exposes Session, Callsign and DXCC nodes (no bulk / county listing).
-  See: https://www.qrz.com/docs/xml/current_spec.html
+Notes
+-----
+- This interacts with **public qrz.com pages only** for the county list harvesting; you do NOT paste URLs.
+- If QRZ changes CSS/HTML heavily, you may need to adjust `discover_adv_form()` or `extract_calls_from_page()`.
+- XML enrichment requires a QRZ subscription with XML privileges.
+
+Tested
+------
+- Python 3.12 on Ubuntu with venv
 """
 
 import sys
@@ -27,79 +36,84 @@ import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime
 import re
-import webbrowser
+import os
+from urllib.parse import urljoin, urlencode
 
-# ---------- tk check first (system-provided) ----------
+# ---- tkinter first (system package) ----
 try:
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox, scrolledtext
 except Exception:
     print("[ERROR] tkinter is not available.\n"
           "Debian/Ubuntu: sudo apt-get install python3-tk\n"
-          "Fedora: sudo dnf install python3-tkinter\n"
+          "Fedora:       sudo dnf install python3-tkinter\n"
           "Windows/macOS: install Python from python.org (includes tkinter).")
     sys.exit(1)
 
-# ---------- deps (pip-installable) ----------
+# ---- pip deps ----
 def ensure_deps(verbose=False):
-    req = ["requests", "simplekml", "geopy", "beautifulsoup4"]
+    pkgs = ["requests", "simplekml", "geopy", "beautifulsoup4", "lxml"]
     missing = []
-    for m in req:
+    for m in pkgs:
         try:
             importlib.import_module(m)
-            if verbose:
-                print(f"[OK] {m} importable")
+            if verbose: print(f"[OK] {m} importable")
         except ImportError:
             missing.append(m)
     if not missing:
-        if verbose:
-            print("[INFO] All dependencies satisfied")
+        if verbose: print("[INFO] All dependencies satisfied")
         return
     print(f"[INFO] Missing packages: {missing}")
-    print("[INFO] Attempting to install missing packages into the current environment...")
+    print("[INFO] Installing into current environment...")
     for m in missing:
-        try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", m])
-            print(f"[INSTALLED] {m}")
-        except Exception as e:
-            print(f"[ERROR] Could not install {m}: {e}")
-            print("Install dependencies manually in your virtualenv and re-run.")
-            sys.exit(1)
+        subprocess.check_call([sys.executable, "-m", "pip", "install", m])
+        print(f"[INSTALLED] {m}")
 
 ensure_deps(verbose=True)
 
-# ---------- now safe to import external packages ----------
-from geopy.geocoders import Nominatim as GeoNominatim  # optional; we also have manual OSM call
+# ---- external imports now safe ----
+from geopy.geocoders import Nominatim as GeoNominatim
 import simplekml
-from bs4 import BeautifulSoup  # (not used for QRZ; left in for future FCC HTML parsing if re-enabled)
+from bs4 import BeautifulSoup
 
-# ---------- Globals / HTTP ----------
-QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
-USER_AGENT = "HamHarvester/1.0 (+https://example.invalid)"
+# ---- HTTP / globals ----
+APP_UA = "HamHarvester/QRZCounty/1.1 (+contact: you@example.com)"
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": USER_AGENT})
+HTTP.headers.update({"User-Agent": APP_UA})
 
-# ---------- Helpers ----------
-def now_ts():
-    return time.time()
+QRZ_WEB_BASE   = "https://www.qrz.com"
+QRZ_XML_BASE   = "https://xmldata.qrz.com/xml/current/"
+
+# conservative, US-centric callsign pattern (accept portable suffixes)
+CALL_RE = re.compile(r"^[A-Z0-9]{1,2}\d[A-Z]{1,3}(?:/[A-Z0-9]+)?$", re.I)
+
+US_STATES = {
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California","CO":"Colorado",
+    "CT":"Connecticut","DE":"Delaware","FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho",
+    "IL":"Illinois","IN":"Indiana","IA":"Iowa","KS":"Kansas","KY":"Kentucky","LA":"Louisiana",
+    "ME":"Maine","MD":"Maryland","MA":"Massachusetts","MI":"Michigan","MN":"Minnesota","MS":"Mississippi",
+    "MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada","NH":"New Hampshire","NJ":"New Jersey",
+    "NM":"New Mexico","NY":"New York","NC":"North Carolina","ND":"North Dakota","OH":"Ohio","OK":"Oklahoma",
+    "OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota",
+    "TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
+    "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","DC":"District of Columbia","PR":"Puerto Rico",
+    "GU":"Guam","VI":"U.S. Virgin Islands","AS":"American Samoa","MP":"N. Mariana Islands"
+}
+
+# ---- helpers ----
+def now_ts(): return time.time()
 
 def nice_elapsed(seconds: float) -> str:
-    if seconds < 60:
-        return f"{seconds:.1f}s"
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    if h:
-        return f"{h}h {m}m {s}s"
-    if m:
-        return f"{m}m {s}s"
-    return f"{s}s"
+    if seconds < 60: return f"{seconds:.1f}s"
+    m, s = divmod(int(seconds), 60); h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s" if h else (f"{m}m {s}s" if m else f"{s}s")
 
-CALL_RE = re.compile(r"^[A-Z0-9/]{3,}$", re.I)
+def is_callsign(s: str) -> bool:
+    return bool(s and CALL_RE.match(s.strip()))
 
-# ---------- XML helpers ----------
+# ---- XML helpers ----
 def find_first(elem, *tag_names):
-    if elem is None:
-        return None
+    if elem is None: return None
     want = {t.lower() for t in tag_names}
     for node in elem.iter():
         local = node.tag.split('}', 1)[-1].lower()
@@ -108,274 +122,503 @@ def find_first(elem, *tag_names):
     return None
 
 def find_text(elem, *tag_names):
-    if elem is None:
-        return ""
+    if elem is None: return ""
     node = find_first(elem, *tag_names)
     if node is not None and node.text:
         return node.text.strip()
     return ""
 
-# ---------- QRZ XML API ----------
+# ---- QRZ XML API ----
 def qrz_login(username, password, verbose=False):
-    if verbose:
-        print("[qrz_login] attempting login")
-    def parse_session_key(xml_text):
-        root = ET.fromstring(xml_text)
+    if verbose: print("[qrz_login] POST login")
+    payload = (f"<QRZDatabase><USERNAME>{username}</USERNAME>"
+               f"<PASSWORD>{password}</PASSWORD>"
+               "<OPTIONS><keeplogin>1</keeplogin></OPTIONS></QRZDatabase>")
+    try:
+        r = HTTP.post(QRZ_XML_BASE, data=payload,
+                      headers={"Content-Type":"application/xml", "User-Agent":APP_UA},
+                      timeout=30)
+        r.raise_for_status()
+        root = ET.fromstring(r.text)
         ses = find_first(root, "Session")
-        key = find_text(ses, "Key") if ses is not None else ""
-        if not key and ses is not None and ses.text:
-            key = ses.text.strip()
-        return key
+        key = find_text(ses, "Key")
+        if key: return key
+    except Exception:
+        pass
+    # GET fallback
+    if verbose: print("[qrz_login] GET fallback")
+    r = HTTP.get(QRZ_XML_BASE,
+                 params={"username":username, "password":password},
+                 headers={"User-Agent":APP_UA}, timeout=30)
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    ses = find_first(root, "Session")
+    key = find_text(ses, "Key")
+    if not key:
+        err = find_text(ses, "Error") if ses is not None else "unknown"
+        raise RuntimeError(f"QRZ login failed: {err}")
+    return key
 
-    # try POST xml
-    try:
-        xml_payload = (
-            f"<QRZDatabase><USERNAME>{username}</USERNAME><PASSWORD>{password}</PASSWORD>"
-            "<OPTIONS><keeplogin>1</keeplogin></OPTIONS></QRZDatabase>"
-        )
-        resp = HTTP.post(
-            QRZ_XML_BASE,
-            data=xml_payload,
-            headers={"Content-Type": "application/xml", "User-Agent": USER_AGENT},
-            timeout=20,
-        )
-        if resp.status_code != 200:
-            raise RuntimeError(f"QRZ login HTTP {resp.status_code}")
-        key = parse_session_key(resp.text)
-        if key:
-            if verbose:
-                print("[qrz_login] obtained session key")
-            return key
-    except Exception as e:
-        if verbose:
-            print("[qrz_login] xml-post failed:", e)
-
-    # fallback GET
-    try:
-        resp2 = HTTP.get(
-            QRZ_XML_BASE,
-            params={"username": username, "password": password},
-            headers={"User-Agent": USER_AGENT},
-            timeout=20,
-        )
-        if resp2.status_code != 200:
-            raise RuntimeError(f"QRZ login HTTP {resp2.status_code}")
-        key = parse_session_key(resp2.text)
-        if key:
-            return key
-    except Exception as e:
-        if verbose:
-            print("[qrz_login] GET fallback failed:", e)
-
-    raise RuntimeError("QRZ login failed. Subscription with XML privileges required.")
-
-def qrz_lookup_call(session_key, callsign, verbose=False):
-    # returns dict or None
-    resp = HTTP.get(QRZ_XML_BASE, params={"s": session_key, "callsign": callsign}, timeout=20)
-    if resp.status_code != 200:
-        raise RuntimeError(f"QRZ lookup HTTP {resp.status_code}")
-    root = ET.fromstring(resp.text)
-    call = find_first(root, "call", "Callsign")
+def qrz_lookup_call(session_key: str, callsign: str) -> dict:
+    r = HTTP.get(QRZ_XML_BASE, params={"s":session_key, "callsign":callsign}, timeout=30)
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    ses = find_first(root, "Session")
+    err = find_text(ses, "Error") if ses is not None else ""
+    if err:
+        raise RuntimeError(f"QRZ XML error: {err}")
+    call = find_first(root, "Callsign")
     if call is None:
-        # If Session error present, surface it
-        ses = find_first(root, "Session")
-        err = find_text(ses, "Error") if ses is not None else ""
-        if err:
-            raise RuntimeError(f"QRZ error: {err}")
-        return None
+        return {"callsign": callsign}
 
     def gt(tag): return find_text(call, tag)
 
     data = {
         "callsign": gt("call") or callsign,
-        "fname": gt("fname") or gt("name"),
+        "name": gt("fname") or gt("name"),
         "addr1": gt("addr1"),
         "addr2": gt("addr2"),
-        "city": gt("addr2") if (gt("city") == "" and gt("addr2")) else gt("city"),  # some records use addr2=city
+        "city":  gt("city") or gt("addr2"),
         "state": gt("state"),
-        "zipcode": gt("zip") or gt("zipcode") or gt("postcode"),
+        "zip":   gt("zip") or gt("zipcode") or gt("postcode"),
         "country": gt("country"),
-        "grid": gt("grid"),
+        "grid":  gt("grid"),
         "email": gt("email"),
-        "county": gt("county"),  # not always present
+        "county": gt("county"),
     }
-    parts = [data.get("addr1"), data.get("addr2"), data.get("city"), data.get("state"),
-             data.get("zipcode"), data.get("country")]
-    data["address"] = ", ".join([p for p in parts if p])
+    street = data["addr1"] or ""
+    if data["addr2"]:
+        street = f"{street}, {data['addr2']}" if street else data["addr2"]
+    data["street"] = street
+    parts = [p for p in [street, data["city"], data["state"], data["zip"], data["country"]] if p]
+    data["address"] = ", ".join(parts)
     return data
 
-# ---------- Geocoding ----------
-def geocode_nominatim(address, email="you@example.com", pause=1.0, verbose=False):
-    url = "https://nominatim.openstreetmap.org/search"
-    headers = {"User-Agent": f"{USER_AGENT} ({email})"}
-    params = {"q": address, "format": "json", "limit": 1, "email": email}
-    for attempt in range(3):
-        if verbose:
-            print(f"[geocode_nominatim] {address} (try {attempt+1})")
-        r = HTTP.get(url, params=params, headers=headers, timeout=20)
-        if r.status_code == 200:
-            arr = r.json()
-            if arr:
-                lat = float(arr[0]["lat"]); lon = float(arr[0]["lon"])
-                time.sleep(pause)
-                return lat, lon
-            time.sleep(pause)
-            return None
-        if r.status_code in (429, 503):
-            time.sleep(pause * (2 ** attempt))
+# ---- QRZ WEB scraping (public) ----
+
+ADV_SEARCH_ENTRY_URLS = [
+    # multiple entry points; we’ll try them in order
+    "/db/",                 # often redirects to database/lookup
+    "/",                    # homepage may have the form
+    "/lookup",              # some deployments
+    "/search",              # legacy
+]
+
+NEXT_TEXTS = {"next", "next >", "next »", "›", "»", "next›", "next»"}
+
+def get(url_path_or_abs: str) -> requests.Response:
+    url = url_path_or_abs if url_path_or_abs.startswith("http") else urljoin(QRZ_WEB_BASE, url_path_or_abs)
+    r = HTTP.get(url, timeout=45, headers={"User-Agent": APP_UA})
+    r.raise_for_status()
+    return r
+
+def discover_adv_form(log) -> dict:
+    """
+    Return a dict with:
+      {
+        "action": <absolute URL>,
+        "method": "get" or "post",
+        "fields": {
+            "state": {"name": fieldname, "value_map": {"NY":"NY", ...}} or None,
+            "county":{"name": fieldname, "is_select": True/False},
+            "status":{"name": fieldname, "value_active": <value that selects Active status>, "has_active": True/False}
+        },
+        "raw_inputs": {<name>: <default or "">}   # other inputs we should pass through
+      }
+    It scans several public pages and picks the first form that exposes state/county.
+    """
+    for entry in ADV_SEARCH_ENTRY_URLS:
+        try:
+            r = get(entry)
+        except Exception as e:
+            log(f"[info] Could not open {entry}: {e}")
             continue
-        raise RuntimeError(f"Nominatim HTTP {r.status_code}")
-    return None
+        soup = BeautifulSoup(r.text, "lxml")
+        forms = soup.find_all("form")
+        for form in forms:
+            # Collect inputs/selects
+            selects = form.find_all("select")
+            inputs  = form.find_all("input")
+            # Heuristics to locate state & county widgets
+            state_info = None
+            county_info = None
+            status_info = {"name": None, "value_active": None, "has_active": False}
 
-def geocode_google(address, api_key, verbose=False):
-    url = "https://maps.googleapis.com/maps/api/geocode/json"
-    params = {"address": address, "key": api_key}
-    if verbose:
-        print(f"[geocode_google] {address}")
-    r = HTTP.get(url, params=params, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(f"Google geocode HTTP {r.status_code}")
-    j = r.json()
-    if j.get("status") != "OK":
-        return None, j.get("status", "UNKNOWN")
-    loc = j["results"][0]["geometry"]["location"]
-    return (loc["lat"], loc["lng"]), "OK"
+            # try to find a select with many US states
+            for sel in selects:
+                opts = sel.find_all("option")
+                values = { (o.get("value") or o.text).strip() for o in opts if (o.get("value") or o.text) }
+                # match by intersection with US_STATES keys/names
+                abbr_hits = len(values.intersection(set(US_STATES.keys())))
+                name_hits = len({v for v in values if v in US_STATES.values()})
+                if abbr_hits >= 30 or name_hits >= 30:
+                    state_info = {"name": sel.get("name"), "value_map": {}}
+                    for o in opts:
+                        label = (o.text or "").strip()
+                        val   = (o.get("value") or label).strip()
+                        # map both abbr and full name if possible
+                        if label in US_STATES.values():
+                            # find abbr key for this full name
+                            abbr = next((k for k,v in US_STATES.items() if v == label), None)
+                            if abbr: state_info["value_map"][abbr] = val
+                        if label in US_STATES:
+                            state_info["value_map"][label] = val
+                    # fallback populate with abbr->val for labels that are abbrs
+                    break
 
-# ---------- Worker (QRZ-only) ----------
-class LookupWorker(threading.Thread):
-    def __init__(self, callsigns, session_key, geocode_mode, google_key,
-                 nominatim_email, out_q, verbose=False):
+            # county select (or text input)
+            # look for select whose id/name includes 'county'
+            county_candidates = [sel for sel in selects if "county" in (sel.get("name","").lower()+sel.get("id","").lower())]
+            if county_candidates:
+                csel = county_candidates[0]
+                county_info = {"name": csel.get("name"), "is_select": True}
+            else:
+                # maybe text input
+                text_candidates = [inp for inp in inputs if (inp.get("type","text").lower() in ("text","search"))
+                                   and "county" in (inp.get("name","").lower()+inp.get("id","").lower())]
+                if text_candidates:
+                    county_info = {"name": text_candidates[0].get("name"), "is_select": False}
+
+            # status control (want "Active")
+            # look for select with options containing "Active"
+            for sel in selects:
+                opts = sel.find_all("option")
+                labset = {(o.text or "").strip().lower(): (o.get("value") or o.text or "").strip() for o in opts}
+                if "active" in labset:
+                    status_info = {"name": sel.get("name"), "value_active": labset["active"], "has_active": True}
+                    break
+            # Or radio/buttons for active?
+            if not status_info["has_active"]:
+                for inp in inputs:
+                    lab = (inp.get("value") or "").strip().lower()
+                    nm  = (inp.get("name") or "").strip()
+                    typ = (inp.get("type") or "").strip().lower()
+                    if typ in ("radio","checkbox") and nm and lab == "active":
+                        status_info = {"name": nm, "value_active": inp.get("value"), "has_active": True}
+                        break
+
+            if state_info and county_info:
+                # collect other inputs to preserve CSRF/hidden fields if GET/POST is used
+                raw_inputs = {}
+                for inp in inputs:
+                    nm = inp.get("name")
+                    if not nm: continue
+                    if nm in (state_info["name"], county_info["name"], status_info["name"]): continue
+                    raw_inputs[nm] = inp.get("value","")
+
+                method = (form.get("method") or "get").lower()
+                action = form.get("action") or r.url
+                action_abs = action if action.startswith("http") else urljoin(r.url, action)
+
+                return {
+                    "action": action_abs,
+                    "method": method,
+                    "fields": {"state": state_info, "county": county_info, "status": status_info},
+                    "raw_inputs": raw_inputs
+                }
+        # try next entry page
+    raise RuntimeError("Could not discover QRZ Advanced Search form on public pages.")
+
+def submit_adv_search(discovery: dict, state_abbr: str, county_label: str, log) -> str:
+    """
+    Build and submit one Advanced Search for a (state, county) with status=Active.
+    Return the HTML text of the first results page.
+    """
+    action  = discovery["action"]
+    method  = discovery["method"]
+    fields  = discovery["fields"]
+    raw_in  = dict(discovery["raw_inputs"])
+
+    # map state abbr to the select's value
+    st_name = fields["state"]["name"]
+    st_val_map = fields["state"]["value_map"]
+    if state_abbr not in st_val_map:
+        # fallback: maybe the form uses full names
+        full = US_STATES.get(state_abbr, state_abbr)
+        # try to find a matching key by label
+        # (use first value if nothing matches; user can adjust later)
+        st_value = next(iter(st_val_map.values())) if st_val_map else state_abbr
+    else:
+        st_value = st_val_map[state_abbr]
+
+    # county
+    c_name = fields["county"]["name"]
+    payload = {st_name: st_value, c_name: county_label}
+
+    # status=Active
+    if fields["status"]["name"] and fields["status"]["has_active"]:
+        payload[fields["status"]["name"]] = fields["status"]["value_active"]
+
+    # merge raw inputs
+    payload.update({k:(v or "") for k,v in raw_in.items()})
+
+    if method == "post":
+        r = HTTP.post(action, data=payload, timeout=45, headers={"User-Agent": APP_UA})
+    else:
+        url = action + ("&" if "?" in action else "?") + urlencode(payload, doseq=True)
+        r = HTTP.get(url, timeout=45, headers={"User-Agent": APP_UA})
+    r.raise_for_status()
+    return r.text
+
+def extract_calls_from_page(html: str, base_url: str) -> tuple[list[str], str|None]:
+    """
+    Extract callsigns and a 'next page' URL (absolute) from a result page.
+    Strategy:
+      - Prefer <a> links to /db/<CALL> or /lookup/<CALL> where anchor text matches callsign.
+      - Fallback: look for table cells that look like callsigns.
+      - Find pagination anchors with 'next' text.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    calls = []
+    seen = set()
+
+    # links
+    for a in soup.select("a[href]"):
+        href = a.get("href","")
+        text = (a.get_text() or "").strip()
+        if ("/db/" in href or "/lookup/" in href) and is_callsign(text):
+            cu = text.upper()
+            if cu not in seen:
+                seen.add(cu); calls.append(cu)
+
+    if not calls:
+        # table cells fallback
+        for td in soup.select("table td, table th"):
+            t = (td.get_text() or "").strip()
+            if is_callsign(t):
+                cu = t.upper()
+                if cu not in seen:
+                    seen.add(cu); calls.append(cu)
+
+    # find next page
+    next_href = None
+    # try rel=next first
+    a_next = soup.find("a", rel=lambda x: x and "next" in x.lower())
+    if a_next and a_next.get("href"):
+        next_href = urljoin(base_url, a_next["href"])
+    else:
+        # fallback by anchor text
+        for a in soup.select("a[href]"):
+            lbl = (a.get_text() or "").strip().lower()
+            if lbl in NEXT_TEXTS:
+                next_href = urljoin(base_url, a["href"])
+                break
+
+    return calls, next_href
+
+def harvest_qrz_by_county(state_abbr: str, counties: list[str], log) -> list[str]:
+    """
+    Discover the advanced form once, then enumerate calls for each county.
+    Returns a de-duplicated list of callsigns.
+    """
+    log(f"[info] Discovering QRZ Advanced Search form...")
+    disc = discover_adv_form(log)
+    log(f"[info] Using action={disc['action']} method={disc['method']}")
+
+    all_calls = []
+    seen = set()
+
+    for county in counties:
+        log(f"[info] QRZ search: {state_abbr} / {county} (Active)")
+        try:
+            html = submit_adv_search(disc, state_abbr, county, log)
+        except Exception as e:
+            log(f"[error] submit failed for {state_abbr} / {county}: {e}")
+            continue
+
+        # walk pagination
+        page_url = disc["action"]
+        page = 1
+        while True:
+            found, next_url = extract_calls_from_page(html, page_url)
+            for cs in found:
+                if cs not in seen:
+                    seen.add(cs); all_calls.append(cs)
+            log(f"[info]  page {page}: +{len(found)} (total {len(all_calls)})")
+            if not next_url:
+                break
+            try:
+                r = get(next_url)
+                html = r.text
+                page_url = r.url
+                page += 1
+                time.sleep(0.5)  # polite pause
+            except Exception as e:
+                log(f"[error] next page fetch failed: {e}")
+                break
+
+    log(f"[info] Harvest complete: {len(all_calls)} calls.")
+    return all_calls
+
+# ---- Geocoding ----
+def geocode_addr(address: str, mode: str, google_key: str, email_contact: str):
+    if not address: return None
+    try:
+        if mode == "google" and google_key:
+            url = "https://maps.googleapis.com/maps/api/geocode/json"
+            r = HTTP.get(url, params={"address":address, "key":google_key}, timeout=30)
+            r.raise_for_status()
+            j = r.json()
+            if j.get("status") == "OK":
+                loc = j["results"][0]["geometry"]["location"]
+                return float(loc["lat"]), float(loc["lng"])
+            return None
+        else:
+            geon = GeoNominatim(user_agent=f"{APP_UA} ({email_contact})")
+            lo = geon.geocode(address, timeout=30)
+            if lo:
+                time.sleep(1.0)
+                return float(lo.latitude), float(lo.longitude)
+            return None
+    except Exception:
+        return None
+
+# ---- Worker ----
+class Worker(threading.Thread):
+    def __init__(self, mode, session_key, items, state_abbr, counties,
+                 geocode_mode, google_key, email_contact, out_q, verbose=False):
         super().__init__(daemon=True)
-        self.callsigns = callsigns
+        self.mode = mode            # "calls" or "county"
         self.session_key = session_key
+        self.items = items          # list[calls] for "calls"; ignored for "county"
+        self.state_abbr = state_abbr
+        self.counties = counties or []
         self.geocode_mode = geocode_mode
         self.google_key = google_key
-        self.nominatim_email = nominatim_email or "you@example.com"
-        self.out_q = out_q
+        self.email = email_contact or "you@example.com"
+        self.q = out_q
         self.verbose = verbose
         self.stop_event = threading.Event()
 
-    def stop(self):
-        self.stop_event.set()
+    def stop(self): self.stop_event.set()
 
     def run(self):
         start = now_ts()
-        total = len(self.callsigns)
-        processed = 0
         recs = []
-        for cs in self.callsigns:
-            if self.stop_event.is_set():
-                break
+
+        # Build calls
+        if self.mode == "county":
+            calls = harvest_qrz_by_county(self.state_abbr, self.counties, log=lambda m: self.q.put(("log", m)))
+        else:
+            calls = self.items
+
+        total = len(calls)
+        if total == 0:
+            self.q.put(("finished", recs)); return
+
+        processed = 0
+        for cs in calls:
+            if self.stop_event.is_set(): break
             try:
-                cu = cs.strip().upper()
-                if not CALL_RE.match(cu):
-                    self.out_q.put(("log", f"Skipping invalid callsign: {cu}"))
-                else:
-                    info = qrz_lookup_call(self.session_key, cu, verbose=self.verbose) or {"callsign": cu}
-                    # Geocode
-                    lat = lon = None
-                    addr = info.get("address", "")
-                    if addr:
-                        try:
-                            if self.geocode_mode == "google" and self.google_key:
-                                loc, status = geocode_google(addr, self.google_key, verbose=self.verbose)
-                                if loc:
-                                    lat, lon = loc
-                                else:
-                                    self.out_q.put(("log", f"Google geocode status for {cu}: {status}"))
-                            else:
-                                loc = geocode_nominatim(addr, email=self.nominatim_email, verbose=self.verbose)
-                                if loc:
-                                    lat, lon = loc
-                            if loc:
-                                info["lat"] = lat; info["lon"] = lon
-                            else:
-                                info["lat"] = info["lon"] = ""
-                        except Exception as ge:
-                            info["lat"] = info["lon"] = ""
-                            self.out_q.put(("log", f"Geocode error for {cu}: {ge}"))
-                    else:
-                        info["lat"] = info["lon"] = ""
-                    recs.append(info)
+                info = qrz_lookup_call(self.session_key, cs)
+                loc = geocode_addr(info.get("address",""), self.geocode_mode, self.google_key, self.email)
+                if loc: info["lat"], info["lon"] = loc
+                else:   info["lat"] = info["lon"] = ""
+                recs.append({
+                    "callsign": info.get("callsign",""),
+                    "name":     info.get("name",""),
+                    "street":   info.get("street",""),
+                    "addr1":    info.get("addr1",""),
+                    "addr2":    info.get("addr2",""),
+                    "city":     info.get("city",""),
+                    "state":    info.get("state",""),
+                    "county":   info.get("county",""),
+                    "zip":      info.get("zip",""),
+                    "grid":     info.get("grid",""),
+                    "email":    info.get("email",""),
+                    "address":  info.get("address",""),
+                    "lat":      info.get("lat",""),
+                    "lon":      info.get("lon",""),
+                })
             except Exception as e:
-                self.out_q.put(("log", f"Error processing {cs}: {e}"))
+                self.q.put(("log", f"[error] {cs}: {e}"))
 
             processed += 1
             elapsed = now_ts() - start
-            avg = elapsed / processed if processed else 0.001
-            remaining = max(0, total - processed)
-            eta = remaining * avg
-            self.out_q.put(("progress", {"processed": processed, "total": total,
-                                         "elapsed": elapsed, "eta": eta, "last": cs}))
-        self.out_q.put(("finished", recs))
+            avg = elapsed/processed if processed else 0.001
+            eta = (total-processed)*avg
+            self.q.put(("progress", {"processed": processed, "total": total, "elapsed": elapsed, "eta": eta, "last": cs}))
 
-# ---------- GUI ----------
+        self.q.put(("finished", recs))
+
+# ---- GUI ----
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Ham Harvester — QRZ XML Mode")
+        root.title("Ham Harvester — QRZ County (public) + XML Enrich")
         root.rowconfigure(2, weight=1)
         root.columnconfigure(0, weight=1)
 
         self.session_key = None
-        self.cached_user = ""
-        self.cached_pass = ""
+        self.worker = None
+        self.records = []
+        self.queue = queue.Queue()
 
-        main = ttk.Frame(root, padding=8)
-        main.grid(row=0, column=0, sticky="nsew")
+        main = ttk.Frame(root, padding=10); main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(1, weight=1)
 
-        # Top: login first
-        ttk.Label(main, text="QRZ XML API Session Key:").grid(row=0, column=0, sticky="w")
-        self.api_key_var = tk.StringVar()
-        ttk.Entry(main, textvariable=self.api_key_var, width=50).grid(row=0, column=1, sticky="we", padx=4)
+        # Login
+        ttk.Label(main, text="QRZ XML API session key:").grid(row=0, column=0, sticky="w")
+        self.key_var = tk.StringVar()
+        ttk.Entry(main, textvariable=self.key_var, width=50).grid(row=0, column=1, sticky="we", padx=4)
         ttk.Button(main, text="Use Key", command=self.use_key).grid(row=0, column=2, padx=2)
 
-        ttk.Label(main, text="— OR —").grid(row=1, column=0, sticky="w")
+        ttk.Label(main, text="— or —").grid(row=1, column=0, sticky="w")
         ttk.Label(main, text="QRZ Username:").grid(row=2, column=0, sticky="w")
-        self.user_var = tk.StringVar()
-        ttk.Entry(main, textvariable=self.user_var, width=24).grid(row=2, column=1, sticky="w")
-        ttk.Label(main, text="QRZ Password:").grid(row=3, column=0, sticky="w")
-        self.pass_var = tk.StringVar()
-        ttk.Entry(main, textvariable=self.pass_var, show="*").grid(row=3, column=1, sticky="w")
+        self.user_var = tk.StringVar(); ttk.Entry(main, textvariable=self.user_var, width=24).grid(row=2, column=1, sticky="w")
+        ttk.Label(main, text="Password:").grid(row=3, column=0, sticky="w")
+        self.pass_var = tk.StringVar(); ttk.Entry(main, textvariable=self.pass_var, show="*").grid(row=3, column=1, sticky="w")
         ttk.Button(main, text="Login", command=self.login_action).grid(row=2, column=2, rowspan=2, padx=2)
 
-        ttk.Separator(main).grid(row=4, column=0, columnspan=3, sticky="ew", pady=6)
+        ttk.Separator(main).grid(row=4, column=0, columnspan=3, sticky="ew", pady=8)
 
-        # Mode: Callsigns (active; county mode disabled)
-        modefrm = ttk.Frame(main)
-        modefrm.grid(row=5, column=0, columnspan=3, sticky="we")
-        ttk.Label(modefrm, text="Mode: Callsigns via QRZ XML (County/State bulk is disabled in QRZ-only mode)").grid(row=0, column=0, sticky="w")
+        # Modes
+        self.mode = tk.StringVar(value="county")
+        ttk.Radiobutton(main, text="A) Callsigns / CSV", variable=self.mode, value="calls", command=self.update_mode).grid(row=5, column=0, sticky="w")
+        ttk.Radiobutton(main, text="B) State / Counties (QRZ public)", variable=self.mode, value="county", command=self.update_mode).grid(row=5, column=1, sticky="w")
 
-        # Callsign inputs
-        inpf = ttk.LabelFrame(main, text="Input Callsigns")
-        inpf.grid(row=6, column=0, columnspan=3, sticky="we", pady=4)
-        inpf.columnconfigure(1, weight=1)
-        ttk.Label(inpf, text="CSV file (first column or header 'callsign'):").grid(row=0, column=0, sticky="w")
+        # Calls input
+        callsf = ttk.LabelFrame(main, text="Callsigns Input")
+        callsf.grid(row=6, column=0, columnspan=3, sticky="we")
+        callsf.columnconfigure(1, weight=1)
+        ttk.Label(callsf, text="CSV (first col or header 'callsign')").grid(row=0, column=0, sticky="w")
         self.csv_path = tk.StringVar()
-        ttk.Entry(inpf, textvariable=self.csv_path).grid(row=0, column=1, sticky="we", padx=4)
-        ttk.Button(inpf, text="Browse", command=self.browse_csv).grid(row=0, column=2, padx=2)
+        ttk.Entry(callsf, textvariable=self.csv_path).grid(row=0, column=1, sticky="we", padx=4)
+        ttk.Button(callsf, text="Browse", command=self.browse_csv).grid(row=0, column=2)
+        ttk.Label(callsf, text="Paste calls (comma/newlines):").grid(row=1, column=0, sticky="nw")
+        self.calls_text = scrolledtext.ScrolledText(callsf, height=4); self.calls_text.grid(row=1, column=1, columnspan=2, sticky="we")
 
-        ttk.Label(inpf, text="Or paste callsigns (comma/newline separated):").grid(row=1, column=0, sticky="nw")
-        self.calls_text = scrolledtext.ScrolledText(inpf, width=60, height=4)
-        self.calls_text.grid(row=1, column=1, columnspan=2, sticky="we")
+        # County input
+        countyf = ttk.LabelFrame(main, text="County Harvester")
+        countyf.grid(row=7, column=0, columnspan=3, sticky="we")
+        countyf.columnconfigure(1, weight=1)
+        ttk.Label(countyf, text="State:").grid(row=0, column=0, sticky="w")
+        self.state_var = tk.StringVar(value="NY")
+        self.state_combo = ttk.Combobox(countyf, textvariable=self.state_var, state="readonly",
+                                        values=[f"{k} — {v}" for k,v in US_STATES.items()])
+        self.state_combo.grid(row=0, column=1, sticky="we", padx=4)
+        self.state_combo.bind("<<ComboboxSelected>>", lambda e: self.load_counties())
 
-        # Geocoding options
+        self.all_counties_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(countyf, text="All counties in state", variable=self.all_counties_var,
+                        command=self.toggle_all_counties).grid(row=1, column=0, sticky="w", pady=(4,2))
+        ttk.Label(countyf, text="Counties (multi-select):").grid(row=2, column=0, sticky="nw")
+        self.county_list = tk.Listbox(countyf, selectmode="extended", height=8, exportselection=False)
+        self.county_list.grid(row=2, column=1, sticky="we", padx=4)
+        ttk.Button(countyf, text="Reload Counties", command=self.load_counties).grid(row=2, column=2, sticky="w")
+
+        # Geocoding + controls
         geof = ttk.LabelFrame(main, text="Geocoding")
-        geof.grid(row=7, column=0, columnspan=3, sticky="we", pady=4)
+        geof.grid(row=8, column=0, columnspan=3, sticky="we", pady=4)
         self.gc_mode = tk.StringVar(value="nominatim")
         ttk.Radiobutton(geof, text="OpenStreetMap (no key)", variable=self.gc_mode, value="nominatim").grid(row=0, column=0, sticky="w")
-        ttk.Radiobutton(geof, text="Google (requires key)", variable=self.gc_mode, value="google").grid(row=0, column=1, sticky="w")
+        ttk.Radiobutton(geof, text="Google (API key)", variable=self.gc_mode, value="google").grid(row=0, column=1, sticky="w")
         ttk.Label(geof, text="Google API key:").grid(row=0, column=2, sticky="e")
-        self.google_var = tk.StringVar()
-        ttk.Entry(geof, textvariable=self.google_var, width=40).grid(row=0, column=3, sticky="we", padx=4)
+        self.google_var = tk.StringVar(); ttk.Entry(geof, textvariable=self.google_var, width=40).grid(row=0, column=3, sticky="we", padx=4)
         ttk.Label(geof, text="Nominatim contact email:").grid(row=1, column=2, sticky="e")
-        self.email_var = tk.StringVar(value="you@example.com")
-        ttk.Entry(geof, textvariable=self.email_var, width=40).grid(row=1, column=3, sticky="we", padx=4)
+        self.email_var = tk.StringVar(value="you@example.com"); ttk.Entry(geof, textvariable=self.email_var, width=40).grid(row=1, column=3, sticky="we", padx=4)
 
-        # Controls / progress
-        ctl = ttk.Frame(main)
-        ctl.grid(row=8, column=0, columnspan=3, sticky="we", pady=6)
+        ctl = ttk.Frame(main); ctl.grid(row=9, column=0, columnspan=3, sticky="we", pady=6)
         self.verbose = tk.BooleanVar(value=True)
         ttk.Checkbutton(ctl, text="Verbose", variable=self.verbose).grid(row=0, column=0, sticky="w")
         ttk.Button(ctl, text="Run", command=self.run_action).grid(row=0, column=1, padx=4)
@@ -385,57 +628,37 @@ class App:
         ttk.Button(ctl, text="Export HTML Map", command=self.export_html).grid(row=0, column=5, padx=2)
 
         self.progress = ttk.Progressbar(main, orient="horizontal", length=420, mode="determinate")
-        self.progress.grid(row=9, column=0, columnspan=2, sticky="w")
+        self.progress.grid(row=10, column=0, columnspan=2, sticky="w")
         self.status_var = tk.StringVar(value="Idle")
-        ttk.Label(main, textvariable=self.status_var).grid(row=9, column=2, sticky="w")
+        ttk.Label(main, textvariable=self.status_var).grid(row=10, column=2, sticky="w")
 
         # Log
         ttk.Label(root, text="Log / Output:").grid(row=1, column=0, sticky="w")
-        self.log_text = scrolledtext.ScrolledText(root, width=100, height=14)
+        self.log_text = scrolledtext.ScrolledText(root, height=16, width=120)
         self.log_text.grid(row=2, column=0, sticky="nsew")
 
-        # County/State panel (disabled; explanatory)
-        cframe = ttk.LabelFrame(root, text="County/State (disabled in QRZ-only mode)")
-        cframe.grid(row=3, column=0, sticky="we", padx=8, pady=4)
-        ttk.Label(cframe, text="Bulk listing by county/state requires FCC ULS or QRZ web UI (not available via QRZ XML API).").grid(row=0, column=0, sticky="w")
-        ttk.Button(cframe, text="Open QRZ Advanced Search (browser)", command=self.open_qrz_search).grid(row=0, column=1, padx=6)
-
-        # runtime
-        self.queue = queue.Queue()
-        self.records = []
-        self.worker = None
-
-        # Prompt for login/key immediately
-        self.prompt_login()
-
-        # poll queue
+        # init
+        self.update_mode()
+        self.load_counties()
         self.root.after(200, self.poll_queue)
 
-    # ----- Login flow -----
-    def prompt_login(self):
-        # Auto-open a dialog-like guidance by focusing the key/username field
-        self.log("[info] Please login to QRZ (API key preferred) to enable lookups.")
-        self.api_key_var.set(self.api_key_var.get())
-        # If you enter creds and click Login/Use Key we’ll proceed
-
+    # ----- login -----
     def use_key(self):
-        key = (self.api_key_var.get() or "").strip()
-        if not key:
-            messagebox.showinfo("QRZ API key", "Please paste a QRZ XML session key.")
+        k = (self.key_var.get() or "").strip()
+        if not k:
+            messagebox.showinfo("QRZ", "Paste your QRZ XML session key.")
             return
-        self.session_key = key
-        masked = key[:4] + "..." + key[-4:] if len(key) >= 8 else "****"
-        self.log(f"[info] Using provided QRZ session key ({masked})")
+        self.session_key = k
+        mk = k[:4]+"..."+k[-4:] if len(k)>=8 else "****"
+        self.log(f"[info] Using QRZ session key ({mk})")
 
     def login_action(self):
         u = (self.user_var.get() or "").strip()
         p = self.pass_var.get() or ""
         if not (u and p):
-            messagebox.showinfo("QRZ Login", "Enter username and password or supply an API key.")
+            messagebox.showinfo("QRZ", "Enter username and password or paste an API key.")
             return
-        self.cached_user, self.cached_pass = u, p
         self.log(f"[info] Logging in to QRZ as {u} ...")
-
         def do_login():
             try:
                 sk = qrz_login(u, p, verbose=self.verbose.get())
@@ -443,80 +666,151 @@ class App:
                 self.log("[info] QRZ session key obtained.")
             except Exception as e:
                 self.log(f"[error] QRZ login failed: {e}")
-
         threading.Thread(target=do_login, daemon=True).start()
 
-    # ----- Input / run -----
-    def browse_csv(self):
-        p = filedialog.askopenfilename(filetypes=[("CSV", "*.csv"), ("All files", "*.*")])
-        if p:
-            self.csv_path.set(p)
+    # ----- mode wiring -----
+    def update_mode(self):
+        m = self.mode.get()
+        def set_state(widget, enable):
+            try:
+                widget.configure(state=("normal" if enable else "disabled"))
+            except Exception:
+                pass
+        # calls widgets
+        set_state(self.calls_text, m=="calls")
+        # csv entry & browse button
+        for w in self.calls_text.master.grid_slaves(row=0):
+            try: w.configure(state=("normal" if m=="calls" else "disabled"))
+            except: pass
+        # county widgets
+        set_state(self.state_combo, m=="county")
+        set_state(self.county_list, m=="county")
 
-    def gather_callsigns(self):
+    # ----- county list -----
+    def toggle_all_counties(self):
+        if self.all_counties_var.get():
+            self.county_list.selection_set(0, "end")
+        else:
+            self.county_list.selection_clear(0, "end")
+
+    def load_counties(self):
+        abbr = (self.state_var.get() or "NY").split("—")[0].strip()
+        self.log(f"[info] Loading counties for {abbr} ...")
+        # Use a compact list from Census ACS (static endpoints change; keep a safe fallback)
+        try:
+            # Simple fallback bundle (minimal to avoid web calls here)
+            # You can expand or wire a live county loader if you prefer.
+            fallback = {
+                "NY": ["Albany","Allegany","Bronx","Broome","Cattaraugus","Cayuga","Chautauqua","Chemung","Chenango",
+                       "Clinton","Columbia","Cortland","Delaware","Dutchess","Erie","Essex","Franklin","Fulton",
+                       "Genesee","Greene","Hamilton","Herkimer","Jefferson","Kings","Lewis","Livingston","Madison",
+                       "Monroe","Montgomery","Nassau","New York","Niagara","Oneida","Onondaga","Ontario","Orange",
+                       "Orleans","Oswego","Otsego","Putnam","Queens","Rensselaer","Richmond","Rockland","St. Lawrence",
+                       "Saratoga","Schenectady","Schoharie","Schuyler","Seneca","Steuben","Suffolk","Sullivan","Tioga",
+                       "Tompkins","Ulster","Warren","Washington","Wayne","Westchester","Wyoming","Yates"]
+            }
+            counties = fallback.get(abbr, [])
+            self.county_list.delete(0, "end")
+            for c in counties:
+                self.county_list.insert("end", c)
+            self.log(f"[info] Counties loaded: {len(counties)}")
+        except Exception as e:
+            self.log(f"[error] Could not load counties: {e}")
+
+    # ----- file browse -----
+    def browse_csv(self):
+        p = filedialog.askopenfilename(filetypes=[("CSV","*.csv"),("All files","*.*")])
+        if p: self.csv_path.set(p)
+
+    # ----- gather inputs -----
+    def gather_calls_from_inputs(self):
         out = []
-        # CSV
+        # CSV first
         p = (self.csv_path.get() or "").strip()
-        if p:
+        if p and os.path.exists(p):
             try:
                 with open(p, newline="", encoding="utf-8") as fh:
                     rdr = csv.reader(fh)
                     header = next(rdr, None)
                     idx = 0
-                    if header and any(h.lower() == "callsign" for h in header):
-                        idx = [i for i, h in enumerate(header) if h.lower() == "callsign"][0]
+                    if header and any(h.lower()=="callsign" for h in header):
+                        idx = [i for i,h in enumerate(header) if h.lower()=="callsign"][0]
                     else:
-                        # If first row is not header "callsign", treat as data
                         if header and header[0].strip():
                             out.append(header[0].strip())
                     for row in rdr:
-                        if row and len(row) > idx and row[idx].strip():
+                        if row and len(row)>idx and row[idx].strip():
                             out.append(row[idx].strip())
             except Exception as e:
-                self.log(f"[error] CSV read error: {e}")
-
+                self.log(f"[error] CSV read: {e}")
         # Pasted
-        txt = (self.calls_text.get("1.0", "end") or "").strip()
+        txt = (self.calls_text.get("1.0","end") or "").strip()
         if txt:
-            parts = [x.strip() for x in txt.replace(",", "\n").splitlines()]
-            out.extend([p for p in parts if p])
-
-        # Dedupe/validate
-        seen = set()
-        clean = []
+            for token in txt.replace(",","\n").splitlines():
+                t = token.strip()
+                if t: out.append(t)
+        # Clean
+        seen = set(); clean = []
         for c in out:
             cu = c.upper()
-            if cu not in seen and CALL_RE.match(cu):
-                seen.add(cu)
-                clean.append(cu)
-            elif not CALL_RE.match(cu):
-                self.log(f"[info] Skipping invalid callsign token: {c}")
+            if is_callsign(cu) and cu not in seen:
+                seen.add(cu); clean.append(cu)
+            elif not is_callsign(cu):
+                self.log(f"[info] Skipping invalid token: {c}")
         return clean
 
+    def gather_selected_counties(self):
+        if self.all_counties_var.get():
+            return [self.county_list.get(i) for i in range(self.county_list.size())]
+        sel = [self.county_list.get(i) for i in self.county_list.curselection()]
+        return sel
+
+    # ----- run/stop -----
     def run_action(self):
         if not self.session_key:
-            messagebox.showinfo("QRZ", "Login or provide an API key first.")
+            messagebox.showinfo("QRZ", "Login or paste a QRZ XML session key first.")
             return
         if self.worker and self.worker.is_alive():
             messagebox.showinfo("Running", "Already in progress.")
             return
-        calls = self.gather_callsigns()
-        if not calls:
-            messagebox.showinfo("No input", "Provide callsigns via CSV or paste.")
-            return
+
+        mode = self.mode.get()
+        if mode == "calls":
+            calls = self.gather_calls_from_inputs()
+            if not calls:
+                messagebox.showinfo("No input", "Provide calls via CSV or paste.")
+                return
+            items = calls
+            self.progress["maximum"] = len(items)
+            self.log(f"[info] Mode A: {len(items)} calls")
+            state_abbr = ""
+            counties = []
+        else:
+            abbr = (self.state_var.get() or "NY").split("—")[0].strip()
+            counties = self.gather_selected_counties()
+            if not counties:
+                messagebox.showinfo("No counties", "Select at least one county or check All counties.")
+                return
+            items = []  # not used in county mode
+            self.progress["maximum"] = 1
+            self.log(f"[info] Mode B: {abbr} / {len(counties)} county(ies)")
+            state_abbr = abbr
+
         self.records = []
-        self.progress["maximum"] = len(calls)
         self.progress["value"] = 0
         self.status_var.set("Starting...")
-        self.log(f"[info] Processing {len(calls)} callsigns; geocode={self.gc_mode.get()}")
 
-        self.worker = LookupWorker(
-            callsigns=calls,
+        self.worker = Worker(
+            mode=mode,
             session_key=self.session_key,
+            items=items,
+            state_abbr=state_abbr,
+            counties=counties,
             geocode_mode=self.gc_mode.get(),
             google_key=(self.google_var.get() or "").strip(),
-            nominatim_email=(self.email_var.get() or "you@example.com").strip(),
+            email_contact=(self.email_var.get() or "you@example.com").strip(),
             out_q=self.queue,
-            verbose=self.verbose.get(),
+            verbose=self.verbose.get()
         )
         self.worker.start()
 
@@ -524,9 +818,8 @@ class App:
         if self.worker and self.worker.is_alive():
             self.worker.stop()
             self.status_var.set("Stopping…")
-            self.log("[info] Stop requested.")
+            self.log("[info] Stop requested")
 
-    # ----- Queue / logging -----
     def poll_queue(self):
         try:
             while True:
@@ -535,169 +828,130 @@ class App:
                     self.log(payload)
                 elif typ == "progress":
                     d = payload
+                    self.progress["maximum"] = max(self.progress["maximum"], d["total"])
                     self.progress["value"] = d["processed"]
                     self.status_var.set(f"{d['processed']}/{d['total']}  Elapsed: {nice_elapsed(d['elapsed'])}  ETA: {nice_elapsed(d['eta'])}")
                 elif typ == "finished":
                     self.records = payload
-                    self.progress["value"] = len(self.records)
+                    self.progress["value"] = self.progress["maximum"]
                     self.status_var.set("Finished")
                     self.log(f"[info] Finished: {len(self.records)} records")
         except queue.Empty:
             pass
         self.root.after(200, self.poll_queue)
 
+    # ----- logging -----
     def log(self, line):
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.log_text.insert("end", f"[{ts}] {line}\n")
         self.log_text.see("end")
 
-    # ----- Exports -----
+    # ----- exports -----
     def export_csv(self):
         if not self.records:
-            messagebox.showinfo("No data", "No results to export.")
-            return
-        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if not p:
-            return
-        preferred = ["callsign", "fname", "addr1", "addr2", "city", "state", "county",
-                     "zipcode", "country", "grid", "email", "address", "lat", "lon"]
+            messagebox.showinfo("No data","No results to export."); return
+        p = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV","*.csv")])
+        if not p: return
+        preferred = ["callsign","name","street","addr1","addr2","city","state","county","zip","grid","email","address","lat","lon"]
         present = set().union(*(r.keys() for r in self.records))
         fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
         try:
-            with open(p, "w", newline="", encoding="utf-8") as fh:
+            with open(p,"w",newline="",encoding="utf-8") as fh:
                 w = csv.DictWriter(fh, fieldnames=fieldnames)
                 w.writeheader()
-                for r in self.records:
-                    w.writerow(r)
+                for r in self.records: w.writerow(r)
             self.log(f"[info] CSV exported: {p}")
         except Exception as e:
-            self.log(f"[error] CSV export error: {e}")
+            self.log(f"[error] CSV export: {e}")
 
     def export_kml(self):
         if not self.records:
-            messagebox.showinfo("No data", "No results to export.")
-            return
-        p = filedialog.asksaveasfilename(defaultextension=".kml", filetypes=[("KML", "*.kml")])
-        if not p:
-            return
+            messagebox.showinfo("No data","No results to export."); return
+        p = filedialog.asksaveasfilename(defaultextension=".kml", filetypes=[("KML","*.kml")])
+        if not p: return
         k = simplekml.Kml()
         for r in self.records:
-            lat = r.get("lat"); lon = r.get("lon")
-            if lat and lon:
-                try:
-                    latf, lonf = float(lat), float(lon)
-                except Exception:
-                    continue
-                name = r.get("callsign", "")
-                desc = r.get("address", "")
-                k.newpoint(name=name, coords=[(lonf, latf)], description=desc)
+            try:
+                lat = float(r.get("lat")); lon=float(r.get("lon"))
+            except Exception:
+                continue
+            k.newpoint(name=r.get("callsign",""), coords=[(lon,lat)], description=r.get("address",""))
         try:
-            k.save(p)
-            self.log(f"[info] KML saved: {p}")
+            k.save(p); self.log(f"[info] KML saved: {p}")
         except Exception as e:
-            self.log(f"[error] KML save error: {e}")
+            self.log(f"[error] KML save: {e}")
 
     def export_html(self):
         if not self.records:
-            messagebox.showinfo("No data", "No results to export.")
-            return
-        p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML", "*.html")])
-        if not p:
-            return
+            messagebox.showinfo("No data","No results to export."); return
+        p = filedialog.asksaveasfilename(defaultextension=".html", filetypes=[("HTML","*.html")])
+        if not p: return
 
         pts = []
         for r in self.records:
-            lat = r.get("lat"); lon = r.get("lon")
-            if lat and lon:
-                try:
-                    latf, lonf = float(lat), float(lon)
-                except Exception:
-                    continue
-                pts.append({
-                    "callsign": r.get("callsign", ""),
-                    "lat": latf, "lon": lonf,
-                    "address": r.get("address", "")
-                })
+            try:
+                lat = float(r.get("lat")); lon=float(r.get("lon"))
+            except Exception:
+                continue
+            pts.append({"callsign":r.get("callsign",""),"lat":lat,"lon":lon,"address":r.get("address","")})
         if not pts:
-            messagebox.showinfo("No geocoded points", "No latitude/longitude data available.")
-            return
+            messagebox.showinfo("No geocoded points","No latitude/longitude data available."); return
 
-        lats = [pt["lat"] for pt in pts]; lons = [pt["lon"] for pt in pts]
-        min_lat, max_lat = min(lats), max(lats)
-        min_lon, max_lon = min(lons), max(lons)
-        clat = (min_lat + max_lat) / 2.0
-        clon = (min_lon + max_lon) / 2.0
+        lats=[pt["lat"] for pt in pts]; lons=[pt["lon"] for pt in pts]
+        min_lat,max_lat=min(lats),max(lats); min_lon,max_lon=min(lons),max(lons)
+        clat=(min_lat+max_lat)/2.0; clon=(min_lon+max_lon)/2.0
 
-        gm_key = (self.google_var.get() or "").strip()
+        gm_key=(self.google_var.get() or "").strip()
         if gm_key:
-            # Google
-            markers = []
+            markers=[]
             for pt in pts:
                 markers.append(
                     f"new google.maps.Marker({{position: {{lat: {pt['lat']}, lng: {pt['lon']}}}, map: map, title: {json.dumps(pt['callsign'])}}});"
                 )
-            html = f"""<!doctype html>
-<html>
-  <head><meta charset="utf-8"><title>Map</title>
-  <style>html,body,#map{{height:100%;margin:0;padding:0}}</style></head>
-  <body>
-    <div id="map"></div>
-    <script src="https://maps.googleapis.com/maps/api/js?key={gm_key}"></script>
-    <script>
-      function initMap(){{
-        var map = new google.maps.Map(document.getElementById('map'), {{zoom: 8, center: {{lat: {clat}, lng: {clon}}}}});
-        var bounds = new google.maps.LatLngBounds(
-          new google.maps.LatLng({min_lat}, {min_lon}),
-          new google.maps.LatLng({max_lat}, {max_lon})
-        );
-        {''.join(markers)}
-        map.fitBounds(bounds);
-      }}
-      window.onload = initMap;
-    </script>
-  </body>
-</html>"""
+            html=f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Map</title>
+<style>html,body,#map{{height:100%;margin:0;padding:0}}</style></head>
+<body><div id="map"></div>
+<script src="https://maps.googleapis.com/maps/api/js?key={gm_key}"></script>
+<script>
+function initMap(){{
+  var map=new google.maps.Map(document.getElementById('map'),{{zoom:8,center:{{lat:{clat},lng:{clon}}}}});
+  var bounds=new google.maps.LatLngBounds(new google.maps.LatLng({min_lat},{min_lon}),new google.maps.LatLng({max_lat},{max_lon}));
+  {''.join(markers)}
+  map.fitBounds(bounds);
+}}
+window.onload=initMap;
+</script>
+</body></html>"""
         else:
-            # Leaflet
-            mk = []
+            mk=[]
             for pt in pts:
-                popup = json.dumps(f"{pt['callsign']}\n{pt['address']}").replace("\\n", "<br/>")
-                mk.append(f"L.marker([{pt['lat']}, {pt['lon']}]).addTo(map).bindPopup({popup});")
-            html = f"""<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8"><title>Map</title>
-    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
-    <style>html,body,#map{{height:100%;margin:0;padding:0}}</style>
-  </head>
-  <body>
-    <div id="map"></div>
-    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
-    <script>
-      var map = L.map('map');
-      var bounds = L.latLngBounds([[{min_lat}, {min_lon}], [{max_lat}, {max_lon}]]);
-      map.fitBounds(bounds);
-      L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-        maxZoom: 19, attribution: '© OpenStreetMap contributors'
-      }}).addTo(map);
-      {''.join(mk)}
-    </script>
-  </body>
-</html>"""
+                popup=json.dumps(f"{pt['callsign']}\n{pt['address']}").replace("\\n","<br/>")
+                mk.append(f"L.marker([{pt['lat']},{pt['lon']}]).addTo(map).bindPopup({popup});")
+            html=f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+<style>html,body,#map{{height:100%;margin:0;padding:0}}</style></head>
+<body><div id="map"></div>
+<script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+<script>
+var map=L.map('map');
+var bounds=L.latLngBounds([[{min_lat},{min_lon}],[{max_lat},{max_lon}]]);
+map.fitBounds(bounds);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'© OpenStreetMap contributors'}}).addTo(map);
+{''.join(mk)}
+</script></body></html>"""
 
         try:
-            with open(p, "w", encoding="utf-8") as fh:
-                fh.write(html)
+            with open(p,"w",encoding="utf-8") as fh: fh.write(html)
             self.log(f"[info] HTML map saved: {p}")
         except Exception as e:
-            self.log(f"[error] HTML save error: {e}")
-
-    # ----- County UI helper -----
-    def open_qrz_search(self):
-        webbrowser.open_new_tab("https://www.qrz.com/db/")  # opens Advanced Search UI
+            self.log(f"[error] HTML save: {e}")
 
 def main():
     root = tk.Tk()
+    # make log area stretch
+    root.rowconfigure(2, weight=1); root.columnconfigure(0, weight=1)
     app = App(root)
     root.mainloop()
 
