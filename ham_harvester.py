@@ -1,145 +1,178 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-Ham Harvester — QRZ County + XML Enrichment
-- Discovers QRZ county pages via FIPS links (no manual URLs needed)
-- Harvests calls for selected state/counties from public qrz.com pages
-- Enriches with QRZ XML API (name, address, grid, email, etc.)
-- Supports direct callsign input and CSV list mode
-- Exports CSV; optional KML + Leaflet map
-- Tkinter GUI with login/API key prompt first; verbose logging; progress; Stop
-
-NOTE: Requires a QRZ XML subscription for enrichment. Scraping uses public pages.
+Ham Harvester
+- QRZ public county harvester (no pasted URLs)
+- QRZ XML API enrichment (name, address, grid, email)
+- CSV export (+ optional KML if simplekml present)
+- GUI (Tkinter) with verbose logging, progress, and Stop control
+- Uses BeautifulSoup with built-in "html.parser" (no lxml dependency)
+- Robust county index parsing (mode=county) and state filtering
+- County page pagination + resilient callsign scraping
+- Modes:
+    A) Call list or CSV of calls
+    B) State + one/more counties (or All counties)
+- Quick Self-Test button on the Counties tab
 """
-
-from __future__ import annotations
+import csv
 import os
 import re
 import sys
-import csv
 import time
-import math
 import queue
-import json
-import html
-import signal
-import random
-import zipfile
 import threading
-import webbrowser
-from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Iterable, Tuple
-from urllib.parse import urljoin, urlencode, urlparse, parse_qs
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse, parse_qs
 
-# ---- Dependency checks -------------------------------------------------------
+# ---- Minimal deps check (we install only if inside a venv) -------------------
+def in_venv() -> bool:
+    return (
+        hasattr(sys, "real_prefix") or
+        (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix) or
+        os.environ.get("VIRTUAL_ENV")
+    ) is not None
 
-missing = []
+def ensure_packages(pkgs: List[str]):
+    missing = []
+    for p in pkgs:
+        try:
+            __import__(p)
+        except Exception:
+            missing.append(p)
+    if missing:
+        print(f"[INFO] Missing packages: {missing}")
+        if in_venv():
+            print("[INFO] Attempting to install missing packages into the current environment...")
+            try:
+                import subprocess
+                subprocess.check_call([sys.executable, "-m", "pip", "install", *missing])
+                for p in missing:
+                    print(f"[INSTALLED] {p}")
+            except Exception as e:
+                print(f"[ERROR] Could not install {missing}: {e}")
+        else:
+            print("[WARN] Not in a virtualenv; please install manually:")
+            print(f"       {sys.executable} -m pip install " + " ".join(missing))
+
+ensure_packages(["requests", "bs4"])
+# Optional
 try:
-    import requests
+    import simplekml  # type: ignore
+    HAVE_KML = True
 except Exception:
-    print("[FATAL] requests missing")
-    sys.exit(1)
+    HAVE_KML = False
 
-try:
-    from bs4 import BeautifulSoup
-except Exception:
-    missing.append("beautifulsoup4")
-
-try:
-    import simplekml
-except Exception:
-    simplekml = None  # Optional
-
-try:
-    from geopy.geocoders import Nominatim
-    from geopy.extra.rate_limiter import RateLimiter
-except Exception:
-    Nominatim = None  # Optional
-
-if missing:
-    print(f"[INFO] Missing packages: {missing}")
-    print("[INFO] Please install into your venv, e.g.:")
-    print("       pip install " + " ".join(missing))
-    # continue; we can still run most UI, but scraping needs bs4
-
-# ---- Tk UI -------------------------------------------------------------------
-
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import requests
+from bs4 import BeautifulSoup
 
 # ---- Constants ---------------------------------------------------------------
-
-QRZ_WEB_BASE = "https://www.qrz.com"
-QRZ_DB_PATH = "/db"
-QRZ_XML_BASE = "https://xmldata.qrz.com/xml/current/"
-USER_AGENT = "HamHarvester/1.3 (+https://github.com/your-org/ham_harvester)"
+QRZ_WEB_BASE = "https://www.qrz.com/"
+QRZ_DB_PATH = "db"
+QRZ_XML_LOGIN = "https://xmldata.qrz.com/xml/current/?"
+DEFAULT_UA = "HamHarvester/1.0 (+https://example.local)"
 
 ALL_STATES = {
-    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California","CO":"Colorado","CT":"Connecticut",
-    "DE":"Delaware","DC":"District of Columbia","FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho","IL":"Illinois",
-    "IN":"Indiana","IA":"Iowa","KS":"Kansas","KY":"Kentucky","LA":"Louisiana","ME":"Maine","MD":"Maryland","MA":"Massachusetts",
-    "MI":"Michigan","MN":"Minnesota","MS":"Mississippi","MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada",
-    "NH":"New Hampshire","NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina","ND":"North Dakota",
-    "OH":"Ohio","OK":"Oklahoma","OR":"Oregon","PA":"Pennsylvania","RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota",
-    "TN":"Tennessee","TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington","WV":"West Virginia",
-    "WI":"Wisconsin","WY":"Wyoming","PR":"Puerto Rico","GU":"Guam","AS":"American Samoa","VI":"U.S. Virgin Islands",
-    "MP":"Northern Mariana Islands"
+    "AL":"Alabama","AK":"Alaska","AZ":"Arizona","AR":"Arkansas","CA":"California",
+    "CO":"Colorado","CT":"Connecticut","DE":"Delaware","DC":"District of Columbia",
+    "FL":"Florida","GA":"Georgia","HI":"Hawaii","ID":"Idaho","IL":"Illinois",
+    "IN":"Indiana","IA":"Iowa","KS":"Kansas","KY":"Kentucky","LA":"Louisiana",
+    "ME":"Maine","MD":"Maryland","MA":"Massachusetts","MI":"Michigan","MN":"Minnesota",
+    "MS":"Mississippi","MO":"Missouri","MT":"Montana","NE":"Nebraska","NV":"Nevada",
+    "NH":"New Hampshire","NJ":"New Jersey","NM":"New Mexico","NY":"New York","NC":"North Carolina",
+    "ND":"North Dakota","OH":"Ohio","OK":"Oklahoma","OR":"Oregon","PA":"Pennsylvania",
+    "RI":"Rhode Island","SC":"South Carolina","SD":"South Dakota","TN":"Tennessee",
+    "TX":"Texas","UT":"Utah","VT":"Vermont","VA":"Virginia","WA":"Washington",
+    "WV":"West Virginia","WI":"Wisconsin","WY":"Wyoming","AS":"American Samoa",
+    "GU":"Guam","MP":"Northern Mariana Islands","PR":"Puerto Rico","VI":"U.S. Virgin Islands"
 }
 
-CSV_DEFAULT_FIELDS = ["callsign","name","street","city","state","county","zip","grid","email"]
+CALL_RE = re.compile(r"^[A-Z0-9]{1,2}\d[A-Z0-9]{1,3}$")
 
-CALL_RE = re.compile(r"\b([A-Z0-9]{1,2}\d{1,4}[A-Z]{1,3})\b", re.I)
-
-def clean_call(cs: str) -> Optional[str]:
-    cs = (cs or "").upper().strip()
-    m = CALL_RE.fullmatch(cs)
-    return m.group(1) if m else None
-
-# ---- Utility: logging to UI thread-safely ------------------------------------
-
-class UiLogger:
-    def __init__(self, text_widget: tk.Text):
-        self.text = text_widget
-        self.lock = threading.Lock()
-
-    def log(self, line: str):
-        with self.lock:
-            self.text.configure(state="normal")
-            self.text.insert("end", line.rstrip() + "\n")
-            self.text.see("end")
-            self.text.configure(state="disabled")
-
-    def hr(self):
-        self.log("-" * 70)
-
-# ---- Networking helpers ------------------------------------------------------
-
+# ---- HTTP helpers ------------------------------------------------------------
 def new_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": USER_AGENT})
+    s.headers.update({"User-Agent": DEFAULT_UA})
     s.timeout = 20
     return s
 
-def get_html(sess: requests.Session, url: str, params: dict | None = None, method: str = "GET", data: dict | None = None) -> str:
-    if method.upper() == "POST":
-        r = sess.post(url, data=data, params=params, timeout=20)
+def get_html(sess: requests.Session, url: str, params: Optional[Dict]=None, method: str="GET") -> str:
+    if method.upper() == "GET":
+        r = sess.get(url, params=params)
     else:
-        r = sess.get(url, params=params, timeout=20)
+        r = sess.post(url, data=params)
     r.raise_for_status()
     return r.text
 
-# ---- QRZ: County index discovery via FIPS links ------------------------------
+# ---- QRZ XML API -------------------------------------------------------------
+@dataclass
+class QrzAuth:
+    session_key: Optional[str] = None
+    using_xml: bool = False
 
+def qrz_xml_login(user: str, password: str) -> QrzAuth:
+    """
+    Returns QrzAuth with session_key if successful, else using_xml=False.
+    """
+    sess = new_session()
+    params = {"username": user, "password": password}
+    try:
+        txt = get_html(sess, QRZ_XML_LOGIN, params=params, method="GET")
+        # naive parse for <Key>...</Key>
+        m = re.search(r"<Key>([^<]+)</Key>", txt)
+        if m:
+            return QrzAuth(session_key=m.group(1), using_xml=True)
+    except Exception:
+        pass
+    return QrzAuth(session_key=None, using_xml=False)
+
+def qrz_xml_lookup(session_key: str, callsign: str) -> Dict[str, str]:
+    """
+    Lookup a callsign via QRZ XML. Returns dict with desired fields; missing fields blank.
+    """
+    sess = new_session()
+    params = {"s": session_key, "callsign": callsign}
+    out = {
+        "callsign": callsign,
+        "name": "",
+        "street": "",
+        "city": "",
+        "state": "",
+        "county": "",
+        "zip": "",
+        "grid": "",
+        "email": ""
+    }
+    try:
+        txt = get_html(sess, QRZ_XML_LOGIN, params=params, method="GET")
+        # minimal pulls (avoid full xml parsing to keep deps light)
+        def g(tag):
+            m = re.search(fr"<{tag}>([^<]*)</{tag}>", txt, re.I)
+            return m.group(1).strip() if m else ""
+        out["name"] = g("fname") + (" " if g("fname") and g("name") else "") + g("name")
+        out["street"] = g("addr1") or g("addr2")
+        out["city"] = g("addr2") if out["street"] else g("addr3")
+        out["state"] = g("state")
+        out["zip"] = g("zip")
+        out["grid"] = g("grid")
+        out["email"] = g("email")
+        # QRZ sometimes has <county>Madison</county>
+        out["county"] = g("county")
+    except Exception:
+        pass
+    return out
+
+# ---- QRZ county index & results scraping (public site) -----------------------
 def parse_fips_county_links(html_text: str) -> List[Dict[str, str]]:
     """
-    Parse any page that contains a list of county anchors like:
-      <a href="https://www.qrz.com/db?fips=01001">Autauga, Alabama</a>
-    Returns list of dicts: {fips, county, state, url}
+    Parse anchors like:
+      <a href="https://www.qrz.com/db?fips=36053">Madison, New York</a>
+    Returns list of dicts: {fips, county, state, url, label}
     """
-    soup = BeautifulSoup(html_text, "lxml")
+    soup = BeautifulSoup(html_text, "html.parser")
     out: List[Dict[str, str]] = []
     seen = set()
+
     for a in soup.select('a[href*="db?fips="]'):
         href = a.get("href", "")
         m = re.search(r"[?&]fips=(\d{5})\b", href)
@@ -147,556 +180,328 @@ def parse_fips_county_links(html_text: str) -> List[Dict[str, str]]:
             continue
         fips = m.group(1)
         label = (a.get_text() or "").strip()
+        county, state = (label, "")
         if "," in label:
             county, state = [p.strip() for p in label.split(",", 1)]
-        else:
-            county, state = label, ""
         url = urljoin(QRZ_WEB_BASE, href)
         key = (fips, county, state)
         if key in seen:
             continue
         seen.add(key)
-        out.append({"fips": fips, "county": county, "state": state, "url": url})
+        out.append({"fips": fips, "county": county, "state": state, "url": url, "label": label})
     return out
 
 def fetch_state_counties(sess: requests.Session, state_abbrev: str) -> List[Dict[str, str]]:
     """
-    Loads the global county index (query mode=county) and filters counties to the given state.
+    Loads the global county index (mode=county) and filters to the chosen state.
     """
     full = ALL_STATES.get(state_abbrev.upper())
     if not full:
         return []
-    # This payload produces a big index page of counties across the US
     url = urljoin(QRZ_WEB_BASE, QRZ_DB_PATH)
-    payload = {"query":"*","cs":"*","sel":"","cmd":"Search","mode":"county"}
+    payload = {"query": "*", "cs": "*", "sel": "", "cmd": "Search", "mode": "county"}
     html_text = get_html(sess, url, params=payload, method="GET")
-    items = parse_fips_county_links(html_text)
-    return [i for i in items if i["state"] == full]
+    items_all = parse_fips_county_links(html_text)
 
-# ---- QRZ: County page → callsigns + pagination -------------------------------
+    target = full.lower().strip()
+    filtered: List[Dict[str, str]] = []
+    for it in items_all:
+        label = (it.get("label") or "").lower()
+        st_in_field = (it.get("state") or "").lower().strip()
+        if st_in_field == target:
+            filtered.append(it)
+        elif label.endswith(", " + target):
+            filtered.append(it)
+        elif (", " + target) in label:
+            filtered.append(it)
+    return filtered or []
 
 def extract_calls_from_page(html_text: str) -> Tuple[List[str], Optional[str]]:
     """
-    Returns (calls_on_page, next_url)
-    - calls are discovered via href="/db/CALL" or "/lookup/CALL" and table text fallback
-    - next_url discovered via rel="next" or text 'Next', '»', '›'
+    Find calls on a county result page; return (calls, next_url or None)
     """
-    soup = BeautifulSoup(html_text, "lxml")
+    soup = BeautifulSoup(html_text, "html.parser")
 
-    # calls via links
-    calls: set[str] = set()
+    calls = set()
+
+    # 1) obvious: links to /db/CALL or /lookup/CALL
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        # absolute or relative OK
-        if "/db/" in href or "/lookup/" in href:
-            # last path segment may be the call
-            try:
-                path = urlparse(href).path
-            except Exception:
-                path = href
-            parts = [p for p in path.split("/") if p]
-            if parts:
-                maybe = parts[-1].upper()
-                c = clean_call(maybe)
-                if c:
-                    calls.add(c)
-        # Also scrape visible text that looks like a call
-        t = (a.get_text() or "").strip()
-        c2 = clean_call(t)
-        if c2:
-            calls.add(c2)
+        # Normalize
+        if href.startswith("//"):
+            href = "https:" + href
+        url = urljoin(QRZ_WEB_BASE, href)
 
-    # very defensive: scan table cells
+        # Extract callsign from /db/<CALL> or /lookup/<CALL>
+        p = urlparse(url)
+        if p.path.startswith("/db/") or p.path.startswith("/lookup/"):
+            call = p.path.split("/")[-1].upper()
+            if CALL_RE.match(call):
+                calls.add(call)
+        else:
+            # Sometimes links like ?callsign=... appear
+            qs = parse_qs(p.query)
+            for k, vs in qs.items():
+                for v in vs:
+                    vv = v.upper()
+                    if CALL_RE.match(vv):
+                        calls.add(vv)
+
+    # 2) fallback: scan table cells for ALL CAPS calls
     if not calls:
-        for td in soup.find_all(["td","span","div"]):
-            txt = (td.get_text() or "").strip()
-            c3 = clean_call(txt)
-            if c3:
-                calls.add(c3)
+        text = soup.get_text(" ", strip=True)
+        for token in re.findall(r"[A-Z0-9]{1,2}\d[A-Z0-9]{1,3}", text):
+            tok = token.upper()
+            if CALL_RE.match(tok):
+                calls.add(tok)
 
-    # next link
-    next_url: Optional[str] = None
-    # rel=next
-    rel_next = soup.find("a", rel=lambda v: v and "next" in v.lower(), href=True)
-    if rel_next:
-        next_url = urljoin(QRZ_WEB_BASE, rel_next["href"])
+    # Next-page link discovery
+    next_url = None
+    # rel="next"
+    a_rel = soup.find("a", attrs={"rel": lambda v: v and "next" in v})
+    if a_rel and a_rel.get("href"):
+        next_url = urljoin(QRZ_WEB_BASE, a_rel["href"])
     else:
-        # textual next
+        # by label
         for a in soup.find_all("a", href=True):
             t = (a.get_text() or "").strip().lower()
-            if t in ("next", "»", "›", "next ›", "next »"):
+            if t in {"next", "»", "›", "next ›", "next »"}:
                 next_url = urljoin(QRZ_WEB_BASE, a["href"])
                 break
 
     return sorted(calls), next_url
 
-def crawl_county_calls(sess: requests.Session, county_url: str, logger: UiLogger | None = None, stop_evt: threading.Event | None = None) -> List[str]:
+def harvest_county_calls(sess: requests.Session, county_url: str, stop_ev: threading.Event, log_fn) -> List[str]:
+    """
+    Follow pagination over a county listing, collect calls.
+    """
+    calls: List[str] = []
     url = county_url
-    all_calls: List[str] = []
-    page_no = 0
-    while url:
-        if stop_evt and stop_evt.is_set():
-            if logger: logger.log("[info] Stop requested — halting pagination.")
+    page = 1
+    seen_pages = set()
+    while url and not stop_ev.is_set():
+        if url in seen_pages:
+            log_fn(f"[warn] Looping pagination detected; breaking.")
             break
-        page_no += 1
-        if logger: logger.log(f"[info]  Fetching county page {page_no}: {url}")
-        html_text = get_html(sess, url)
-        calls, next_url = extract_calls_from_page(html_text)
-        if logger: logger.log(f"[info]   + {len(calls)} calls on page {page_no}")
-        # append while preserving order and uniqueness
-        seen = set(all_calls)
-        for c in calls:
-            if c not in seen:
-                all_calls.append(c)
-                seen.add(c)
-        if not next_url:
+        seen_pages.add(url)
+
+        try:
+            html = get_html(sess, url, method="GET")
+        except Exception as e:
+            log_fn(f"[error] County page fetch failed (page {page}): {e}")
             break
+
+        found, next_url = extract_calls_from_page(html)
+        log_fn(f"[info] Page {page}: +{len(found)} call(s)")
+        calls.extend([c for c in found if c not in calls])
+
         url = next_url
-        time.sleep(0.75)  # be polite
-    return all_calls
+        page += 1
+        time.sleep(0.3)  # be polite
+    return calls
 
-# ---- QRZ XML: auth + lookup --------------------------------------------------
-
-@dataclass
-class QrzCreds:
-    username: str = ""
-    password: str = ""
-    api_key: str = ""      # If QRZ provided a direct key, you can store it here to skip username/password
-
-@dataclass
-class QrzSession:
-    sess: requests.Session
-    xml_session_key: Optional[str] = None
-    creds: QrzCreds = field(default_factory=QrzCreds)
-
-def qrz_xml_login(q: QrzSession) -> str:
-    """
-    Login to QRZ XML. If api_key provided, it’s used as 's=' session (some deployments allow that).
-    Otherwise we get 'Key' by username/password.
-    """
-    if q.creds.api_key:
-        q.xml_session_key = q.creds.api_key.strip()
-        return q.xml_session_key
-
-    params = {"username": q.creds.username, "password": q.creds.password}
-    r = q.sess.get(QRZ_XML_BASE, params=params, timeout=20)
-    r.raise_for_status()
-    text = r.text
-    # crude parse for <Key>...</Key>
-    m = re.search(r"<Key>([^<]+)</Key>", text)
-    if not m:
-        em = re.search(r"<Error>([^<]+)</Error>", text)
-        raise RuntimeError(f"QRZ XML login failed: {em.group(1) if em else 'unknown error'}")
-    key = m.group(1).strip()
-    q.xml_session_key = key
-    return key
-
-def qrz_xml_lookup(q: QrzSession, callsign: str) -> Dict[str, str]:
-    """
-    Fetches XML record for a callsign. Returns a dict with desired fields.
-    """
-    if not q.xml_session_key:
-        raise RuntimeError("Not logged in to QRZ XML")
-    params = {"s": q.xml_session_key, "callsign": callsign}
-    r = q.sess.get(QRZ_XML_BASE, params=params, timeout=20)
-    r.raise_for_status()
-    t = r.text
-
-    # retry if session expired
-    if "<Session>" in t and "<Error>Session Timeout" in t:
-        qrz_xml_login(q)
-        params["s"] = q.xml_session_key
-        r = q.sess.get(QRZ_XML_BASE, params=params, timeout=20)
-        r.raise_for_status()
-        t = r.text
-
-    # quick-n-dirty XML field extraction
-    def gx(tag):
-        m = re.search(rf"<{tag}>(.*?)</{tag}>", t, flags=re.S)
-        return html.unescape(m.group(1)).strip() if m else ""
-
-    # map out fields
-    info = {
-        "callsign": gx("call") or callsign.upper(),
-        "name": f"{gx('fname')} {gx('name')}".strip() or gx("attn") or gx("name"),
-        "street": gx("addr2") or gx("addr1"),
-        "city": gx("addr3") or gx("addr2"),
-        "state": gx("state"),
-        "county": gx("county"),
-        "zip": gx("zip"),
-        "grid": gx("grid"),
-        "email": gx("email"),
-        "country": gx("country"),
-    }
-    # normalize whitespace
-    for k, v in list(info.items()):
-        if isinstance(v, str):
-            info[k] = re.sub(r"\s+", " ", v).strip()
-    return info
-
-# ---- Exporters ---------------------------------------------------------------
-
-def write_csv(rows: List[Dict[str, str]], path: str, preferred: List[str] | None = None) -> None:
-    if not rows:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            f.write("")  # create empty
+# ---- KML (optional) ----------------------------------------------------------
+def export_kml(recs: List[Dict[str, str]], path: str):
+    if not HAVE_KML:
         return
-    if preferred is None:
-        preferred = CSV_DEFAULT_FIELDS
-    present = set()
-    for r in rows:
-        present.update(r.keys())
-    fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
-
-def write_kml(rows: List[Dict[str, str]], path: str) -> None:
-    if simplekml is None:
-        raise RuntimeError("simplekml not installed")
     kml = simplekml.Kml()
-    for r in rows:
-        name = r.get("callsign","")
-        desc = "\n".join(f"{k}: {v}" for k, v in r.items() if v and k != "callsign")
-        # Try basic city, state point if no lat/lon
-        p = kml.newpoint(name=name, description=desc)
-        # No geocoding here; KML will just have named points
+    for r in recs:
+        name = r.get("callsign", "")
+        addr = ", ".join(filter(None, [r.get("street",""), r.get("city",""), r.get("state",""), r.get("zip","")]))
+        pm = kml.newpoint(name=name, description=addr)
+        # No geocode here (would need external service); KML will at least list entries.
     kml.save(path)
 
-def write_leaflet_map(rows: List[Dict[str, str]], path: str) -> None:
-    """
-    Minimal Leaflet map with markers using city/state (no geocoding here).
-    """
-    import json
-    points = []
-    for r in rows:
-        label = r.get("callsign","")
-        popup = "<br>".join(f"<b>{html.escape(k)}</b>: {html.escape(v)}" for k,v in r.items() if v)
-        points.append({"label": label, "popup": popup})
-    html_doc = f"""<!doctype html>
-<html><head><meta charset="utf-8">
-<title>Ham Harvester Map</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
-<style>html,body,#map{{height:100%;margin:0;}} .marker-label{{font: 12px/1.2 sans-serif;}}</style>
-</head>
-<body>
-<div id="map"></div>
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-<script>
-var map = L.map('map').setView([39.5,-98.35], 4);
-L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{
-    maxZoom: 19, attribution: '&copy; OpenStreetMap'
-}}).addTo(map);
-var pts = {json.dumps(points)};
-pts.forEach(p => {{
-    L.marker(map.getCenter()).addTo(map).bindPopup(p.popup);
-}});
-</script>
-</body></html>"""
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(html_doc)
-
-# ---- Worker thread -----------------------------------------------------------
-
-class HarvesterThread(threading.Thread):
-    def __init__(self, app: "App"):
-        super().__init__(daemon=True)
-        self.app = app
-        self.stop_evt = threading.Event()
-
-    def request_stop(self):
-        self.stop_evt.set()
-
-    def run(self):
-        try:
-            self._run_impl()
-        except Exception as e:
-            self.app.log(f"[error] {e.__class__.__name__}: {e}")
-
-    # Core flow based on selected mode
-    def _run_impl(self):
-        app = self.app
-        logger = app.logger
-        logger.hr()
-
-        sess = new_session()
-        qrz = QrzSession(sess=sess, creds=QrzCreds(app.username.get(), app.password.get(), app.api_key.get()))
-        logger.log(f"[info] Logging in to QRZ ...")
-        key = qrz_xml_login(qrz)
-        logger.log("[info] QRZ XML session ready.")
-
-        mode = app.mode.get()  # A: callsigns; B: CSV; C: counties
-        out_rows: List[Dict[str, str]] = []
-
-        if mode == "A":
-            # Direct callsigns typed
-            raw = app.callsigns_text.get("1.0","end").strip().splitlines()
-            calls = []
-            for line in raw:
-                for token in re.split(r"[,\s]+", line.strip()):
-                    c = clean_call(token)
-                    if c: calls.append(c)
-            calls = sorted(set(calls))
-            logger.log(f"[info] {len(calls)} calls queued for lookup.")
-            out_rows = self.process_calls(qrz, calls, logger)
-
-        elif mode == "B":
-            # CSV of callsigns
-            path = app.csv_path.get().strip()
-            if not os.path.isfile(path):
-                logger.log("[error] CSV file not found.")
-                return
-            calls = []
-            with open(path, "r", encoding="utf-8", newline="") as f:
-                rdr = csv.reader(f)
-                for row in rdr:
-                    for cell in row:
-                        c = clean_call(cell)
-                        if c: calls.append(c)
-            calls = sorted(set(calls))
-            logger.log(f"[info] {len(calls)} calls from CSV queued for lookup.")
-            out_rows = self.process_calls(qrz, calls, logger)
-
-        else:
-            # Counties mode
-            state = app.state_var.get().strip().upper()
-            chosen = [app.counties_listbox.get(i) for i in app.counties_listbox.curselection()]
-            if app.all_counties_var.get():
-                # populate via live fetch if not already cached in UI
-                if not app.state_counties.get(state):
-                    logger.log(f"[info] Loading counties for {state} ...")
-                    items = fetch_state_counties(sess, state)
-                    app.state_counties[state] = items
-                chosen = [i["county"] for i in app.state_counties[state]]
-            if not chosen:
-                logger.log("[error] No counties selected.")
-                return
-
-            # for each county, get county URL, crawl calls, then XML enrich
-            # ensure state counties map exists
-            if not app.state_counties.get(state):
-                logger.log(f"[info] Loading counties for {state} ...")
-                items = fetch_state_counties(sess, state)
-                app.state_counties[state] = items
-
-            county_map = {i["county"]: i["url"] for i in app.state_counties[state]}
-            all_calls: List[str] = []
-            for county in chosen:
-                if self.stop_evt.is_set():
-                    logger.log("[info] Stop requested — exiting before next county.")
-                    break
-                url = county_map.get(county)
-                if not url:
-                    logger.log(f"[warn] No FIPS URL found for {county}, {state}")
-                    continue
-                logger.log(f"[info] Harvesting {county}, {state} ...")
-                calls = crawl_county_calls(sess, url, logger, self.stop_evt)
-                logger.log(f"[info] {county}: collected {len(calls)} calls")
-                all_calls.extend(calls)
-                time.sleep(0.5)
-
-            uniq_calls = sorted(set(all_calls))
-            logger.log(f"[info] Total unique calls to enrich: {len(uniq_calls)}")
-            out_rows = self.process_calls(qrz, uniq_calls, logger)
-
-        # export
-        if out_rows:
-            out_csv = app.out_csv_path.get().strip() or f"harvest_{int(time.time())}.csv"
-            write_csv(out_rows, out_csv, CSV_DEFAULT_FIELDS)
-            logger.log(f"[info] CSV written: {out_csv}")
-            if app.make_kml_var.get():
-                try:
-                    out_kml = os.path.splitext(out_csv)[0] + ".kml"
-                    write_kml(out_rows, out_kml)
-                    logger.log(f"[info] KML written: {out_kml}")
-                except Exception as e:
-                    logger.log(f"[warn] KML not created: {e}")
-            if app.make_map_var.get():
-                try:
-                    out_html = os.path.splitext(out_csv)[0] + "_map.html"
-                    write_leaflet_map(out_rows, out_html)
-                    logger.log(f"[info] Map written: {out_html}")
-                except Exception as e:
-                    logger.log(f"[warn] Map not created: {e}")
-        else:
-            logger.log("[info] Nothing to export.")
-
-        logger.hr()
-        logger.log("[info] Finished.")
-
-    def process_calls(self, qrz: QrzSession, calls: List[str], logger: UiLogger) -> List[Dict[str, str]]:
-        out_rows: List[Dict[str, str]] = []
-        total = len(calls)
-        for idx, c in enumerate(calls, 1):
-            if self.stop_evt.is_set():
-                logger.log("[info] Stop requested — halting call lookups.")
-                break
-            logger.log(f"[info] [{idx}/{total}] XML: {c}")
-            try:
-                info = qrz_xml_lookup(qrz, c)
-                out_rows.append(info)
-            except Exception as e:
-                logger.log(f"[error] {c}: {e}")
-            # progress
-            pct = int(idx * 100 / max(1,total))
-            self.app.progress["value"] = pct
-            self.app.progress.update_idletasks()
-            time.sleep(0.25)
-        return out_rows
-
-# ---- Tk App ------------------------------------------------------------------
+# ---- GUI ---------------------------------------------------------------------
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
 
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Ham Harvester — QRZ County + XML")
-        self.state_counties: Dict[str, List[Dict[str,str]]] = {}
-        self.worker: Optional[HarvesterThread] = None
+        self.root.title("Ham Harvester")
+        self.root.geometry("950x650")
 
-        # Top: QRZ creds / API key
-        creds = ttk.LabelFrame(root, text="QRZ Login / API Key (required first)")
-        creds.pack(fill="x", padx=8, pady=8)
+        # State
+        self.auth = QrzAuth()
+        self.stop_ev = threading.Event()
+        self.worker: Optional[threading.Thread] = None
+        self.log_q: "queue.Queue[str]" = queue.Queue()
+        self.state_counties: Dict[str, List[Dict[str, str]]] = {}
 
-        self.username = tk.StringVar()
-        self.password = tk.StringVar()
-        self.api_key = tk.StringVar()
+        # UI
+        self.build_ui()
 
-        row = ttk.Frame(creds); row.pack(fill="x", padx=6, pady=4)
-        ttk.Label(row, text="Username:").pack(side="left")
-        ttk.Entry(row, textvariable=self.username, width=18).pack(side="left", padx=6)
-        ttk.Label(row, text="Password:").pack(side="left")
-        ttk.Entry(row, textvariable=self.password, width=18, show="*").pack(side="left", padx=6)
-        ttk.Label(row, text="or XML API Key:").pack(side="left")
-        ttk.Entry(row, textvariable=self.api_key, width=28).pack(side="left", padx=6)
-        ttk.Button(row, text="Test Login", command=self.test_login).pack(side="right")
+        # Prompt login/API key first
+        self.root.after(200, self.prompt_login)
 
-        # Mode chooser
-        modes = ttk.LabelFrame(root, text="Mode")
-        modes.pack(fill="x", padx=8, pady=4)
-        self.mode = tk.StringVar(value="C")  # default counties
-        ttk.Radiobutton(modes, text="A) Callsigns (typed below)", variable=self.mode, value="A", command=self.on_mode_change).pack(anchor="w")
-        ttk.Radiobutton(modes, text="B) Callsign CSV file", variable=self.mode, value="B", command=self.on_mode_change).pack(anchor="w")
-        ttk.Radiobutton(modes, text="C) State + Counties (QRZ public)", variable=self.mode, value="C", command=self.on_mode_change).pack(anchor="w")
+        # log pump
+        self.root.after(100, self.flush_logs)
 
-        # A) callsigns text
-        a_frame = ttk.LabelFrame(root, text="A) Enter callsigns (comma/space/line separated)")
-        a_frame.pack(fill="both", padx=8, pady=4)
-        self.callsigns_text = tk.Text(a_frame, height=5, width=80)
-        self.callsigns_text.pack(fill="both", padx=6, pady=6)
+    # ---------- UI building ----------
+    def build_ui(self):
+        main = ttk.Frame(self.root, padding=8)
+        main.pack(fill="both", expand=True)
 
-        # B) CSV chooser
-        b_frame = ttk.LabelFrame(root, text="B) Callsign CSV path")
-        b_frame.pack(fill="x", padx=8, pady=4)
-        self.csv_path = tk.StringVar()
-        b_row = ttk.Frame(b_frame); b_row.pack(fill="x", padx=6, pady=4)
-        ttk.Entry(b_row, textvariable=self.csv_path).pack(side="left", fill="x", expand=True)
-        ttk.Button(b_row, text="Browse…", command=self.choose_csv).pack(side="left", padx=6)
+        # Top controls
+        top = ttk.Frame(main)
+        top.pack(fill="x")
+        self.btn_stop = ttk.Button(top, text="Stop", command=self.stop, state="disabled")
+        self.btn_stop.pack(side="right", padx=4)
+        self.btn_run = ttk.Button(top, text="Run", command=self.run_action)
+        self.btn_run.pack(side="right", padx=4)
 
-        # C) State + counties
-        c_frame = ttk.LabelFrame(root, text="C) Select State and County/Counties")
-        c_frame.pack(fill="both", padx=8, pady=6)
-        c_row1 = ttk.Frame(c_frame); c_row1.pack(fill="x", padx=6, pady=4)
-        self.state_var = tk.StringVar(value="NY")
-        ttk.Label(c_row1, text="State:").pack(side="left")
-        self.state_combo = ttk.Combobox(c_row1, state="readonly", values=sorted(ALL_STATES.keys()), textvariable=self.state_var, width=6)
-        self.state_combo.pack(side="left")
-        ttk.Button(c_row1, text="Load Counties", command=self.load_counties).pack(side="left", padx=8)
+        # Notebook
+        nb = ttk.Notebook(main)
+        nb.pack(fill="both", expand=True, pady=(6,0))
 
-        self.all_counties_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(c_row1, text="All counties in state", variable=self.all_counties_var).pack(side="left", padx=8)
+        # Mode A tab (calls)
+        self.tab_calls = ttk.Frame(nb)
+        nb.add(self.tab_calls, text="Mode A: Calls/CSV")
+        self.build_tab_calls(self.tab_calls)
 
-        c_row2 = ttk.Frame(c_frame); c_row2.pack(fill="both", padx=6, pady=4, expand=True)
-        self.counties_listbox = tk.Listbox(c_row2, selectmode="extended", height=8)
-        self.counties_listbox.pack(side="left", fill="both", expand=True)
-        sb = ttk.Scrollbar(c_row2, orient="vertical", command=self.counties_listbox.yview)
-        sb.pack(side="left", fill="y")
-        self.counties_listbox.configure(yscrollcommand=sb.set)
+        # Mode B tab (counties)
+        self.tab_counties = ttk.Frame(nb)
+        nb.add(self.tab_counties, text="Mode B: State/Counties")
+        self.build_tab_counties(self.tab_counties)
 
-        c_row3 = ttk.Frame(c_frame); c_row3.pack(fill="x", padx=6, pady=4)
-        ttk.Button(c_row3, text="Test County Page", command=self.test_county_page).pack(side="left")
+        # Bottom: output + log
+        bottom = ttk.Frame(main)
+        bottom.pack(fill="both", expand=True)
 
-        # Output options
-        out_frame = ttk.LabelFrame(root, text="Output")
-        out_frame.pack(fill="x", padx=8, pady=6)
-        self.out_csv_path = tk.StringVar(value="harvest.csv")
-        of = ttk.Frame(out_frame); of.pack(fill="x", padx=6, pady=4)
-        ttk.Label(of, text="CSV file:").pack(side="left")
-        ttk.Entry(of, textvariable=self.out_csv_path, width=40).pack(side="left", padx=6)
-        ttk.Button(of, text="Browse…", command=self.choose_out_csv).pack(side="left")
-        self.make_kml_var = tk.BooleanVar(value=False)
-        self.make_map_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(of, text="Also create KML", variable=self.make_kml_var).pack(side="left", padx=10)
-        ttk.Checkbutton(of, text="Also create HTML map", variable=self.make_map_var).pack(side="left")
+        out_frame = ttk.LabelFrame(bottom, text="Output Options")
+        out_frame.pack(fill="x", pady=6)
+        self.out_csv_var = tk.StringVar(value="output.csv")
+        ttk.Label(out_frame, text="CSV path:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Entry(out_frame, textvariable=self.out_csv_var, width=50).grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        ttk.Button(out_frame, text="Browse...", command=self.pick_csv).grid(row=0, column=2, padx=6, pady=4)
+        self.kml_enable = tk.BooleanVar(value=False)
+        ttk.Checkbutton(out_frame, text="Also write KML (simple list)", variable=self.kml_enable).grid(row=0, column=3, padx=8)
 
-        # Controls + progress
-        ctrl = ttk.Frame(root); ctrl.pack(fill="x", padx=8, pady=4)
-        ttk.Button(ctrl, text="Run", command=self.run_action).pack(side="left")
-        ttk.Button(ctrl, text="Stop", command=self.stop).pack(side="left", padx=6)
-        self.progress = ttk.Progressbar(ctrl, orient="horizontal", mode="determinate", length=280, maximum=100)
-        self.progress.pack(side="left", padx=10, fill="x", expand=True)
+        # Log
+        log_frame = ttk.LabelFrame(bottom, text="Log")
+        log_frame.pack(fill="both", expand=True)
+        self.log_text = tk.Text(log_frame, height=14, wrap="word")
+        self.log_text.pack(fill="both", expand=True)
+        self.log("[info] Ready.")
 
-        # Log output
-        logf = ttk.LabelFrame(root, text="Log")
-        logf.pack(fill="both", padx=8, pady=6, expand=True)
-        self.log_text = tk.Text(logf, height=14, state="disabled")
-        self.log_text.pack(side="left", fill="both", expand=True)
-        logsb = ttk.Scrollbar(logf, orient="vertical", command=self.log_text.yview)
-        logsb.pack(side="left", fill="y")
-        self.log_text.configure(yscrollcommand=logsb.set)
-        self.logger = UiLogger(self.log_text)
+    def build_tab_calls(self, parent: ttk.Frame):
+        frm = ttk.Frame(parent, padding=8)
+        frm.pack(fill="both", expand=True)
 
-        self.on_mode_change()
+        self.calls_in_var = tk.StringVar()
+        ttk.Label(frm, text="Call(s), comma/space-separated:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.calls_in_var, width=60).grid(row=1, column=0, sticky="w", pady=4)
 
-    # --- UI helpers -----------------------------------------------------------
+        ttk.Separator(frm, orient="horizontal").grid(row=2, column=0, sticky="ew", pady=6)
 
-    def log(self, line: str):
-        self.logger.log(line)
+        csv_row = ttk.Frame(frm)
+        csv_row.grid(row=3, column=0, sticky="w")
+        self.csv_path_var = tk.StringVar()
+        ttk.Label(csv_row, text="Or CSV with column 'callsign':").pack(side="left")
+        ttk.Entry(csv_row, textvariable=self.csv_path_var, width=50).pack(side="left", padx=6)
+        ttk.Button(csv_row, text="Choose...", command=self.pick_calls_csv).pack(side="left")
 
-    def on_mode_change(self):
-        mode = self.mode.get()
-        # Enable/disable panes to guide user
-        def set_state(widget, enabled: bool):
-            try:
-                widget.configure(state=("normal" if enabled else "disabled"))
-            except tk.TclError:
-                pass
+    def build_tab_counties(self, parent: ttk.Frame):
+        frm = ttk.Frame(parent, padding=8)
+        frm.pack(fill="both", expand=True)
 
-        # A
-        set_state(self.callsigns_text, mode == "A")
-        # B
-        for w in ():
-            set_state(w, mode == "B")
-        # C
-        for w in (self.state_combo, self.counties_listbox):
-            set_state(w, mode == "C")
+        # State select
+        row1 = ttk.Frame(frm)
+        row1.pack(fill="x")
+        ttk.Label(row1, text="State:").pack(side="left")
+        self.state_var = tk.StringVar()
+        st = ttk.Combobox(row1, textvariable=self.state_var, width=6, state="readonly",
+                          values=sorted(ALL_STATES.keys()))
+        st.pack(side="left", padx=6)
+        ttk.Button(row1, text="Load counties", command=self.load_counties).pack(side="left", padx=6)
 
-    def choose_csv(self):
-        p = filedialog.askopenfilename(title="Choose callsign CSV", filetypes=[("CSV","*.csv"),("All files","*.*")])
-        if p:
-            self.csv_path.set(p)
+        # County list
+        mid = ttk.Frame(frm)
+        mid.pack(fill="both", expand=True, pady=(8,4))
+        ttk.Label(mid, text="Counties (select one or more; empty = ALL):").pack(anchor="w")
+        self.counties_listbox = tk.Listbox(mid, height=12, selectmode="extended")
+        self.counties_listbox.pack(fill="both", expand=True)
 
-    def choose_out_csv(self):
-        p = filedialog.asksaveasfilename(title="Save CSV as...", defaultextension=".csv",
-                                         filetypes=[("CSV","*.csv"),("All files","*.*")])
-        if p:
-            self.out_csv_path.set(p)
+        # Quick Self-Test
+        row2 = ttk.Frame(frm)
+        row2.pack(fill="x")
+        ttk.Button(row2, text="Quick Self-Test (parse county page for sample)",
+                   command=self.quick_self_test).pack(side="left", pady=6)
 
-    # --- QRZ login test -------------------------------------------------------
+    # ---------- Small helpers ----------
+    def pick_csv(self):
+        path = filedialog.asksaveasfilename(defaultextension=".csv",
+                                            filetypes=[("CSV","*.csv")],
+                                            initialfile=self.out_csv_var.get() or "output.csv")
+        if path:
+            self.out_csv_var.set(path)
 
-    def test_login(self):
+    def pick_calls_csv(self):
+        path = filedialog.askopenfilename(filetypes=[("CSV","*.csv")])
+        if path:
+            self.csv_path_var.set(path)
+
+    def log(self, msg: str):
+        stamp = time.strftime("[%Y-%m-%d %H:%M:%S]")
+        self.log_q.put(f"{stamp} {msg}")
+
+    def flush_logs(self):
         try:
-            sess = new_session()
-            q = QrzSession(sess=sess, creds=QrzCreds(self.username.get(), self.password.get(), self.api_key.get()))
-            key = qrz_xml_login(q)
-            self.log("[info] QRZ XML login OK.")
-        except Exception as e:
-            self.log(f"[error] Login failed: {e}")
+            while True:
+                line = self.log_q.get_nowait()
+                self.log_text.insert("end", line + "\n")
+                self.log_text.see("end")
+        except queue.Empty:
+            pass
+        self.root.after(100, self.flush_logs)
 
-    # --- Counties loading / test ---------------------------------------------
+    # ---------- Login prompt ----------
+    def prompt_login(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("QRZ Login / API Key")
+        dlg.transient(self.root)
+        dlg.grab_set()
 
+        ttk.Label(dlg, text="Provide either QRZ XML username/password OR an existing XML session key.\n"
+                            "If you only want to scrape calls (no enrichment), leave all blank.",
+                  justify="left").grid(row=0, column=0, columnspan=2, padx=10, pady=8, sticky="w")
+
+        u_var = tk.StringVar()
+        p_var = tk.StringVar()
+        k_var = tk.StringVar()
+
+        ttk.Label(dlg, text="User:").grid(row=1, column=0, sticky="e", padx=6, pady=2)
+        ttk.Entry(dlg, textvariable=u_var, width=30).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Label(dlg, text="Pass:").grid(row=2, column=0, sticky="e", padx=6, pady=2)
+        ttk.Entry(dlg, textvariable=p_var, width=30, show="•").grid(row=2, column=1, sticky="w", padx=6)
+        ttk.Label(dlg, text="XML Session Key:").grid(row=3, column=0, sticky="e", padx=6, pady=2)
+        ttk.Entry(dlg, textvariable=k_var, width=30).grid(row=3, column=1, sticky="w", padx=6)
+
+        def do_ok():
+            user = u_var.get().strip()
+            pw = p_var.get().strip()
+            key = k_var.get().strip()
+            if key:
+                self.auth = QrzAuth(session_key=key, using_xml=True)
+                self.log("[info] Using provided QRZ XML session key.")
+            elif user and pw:
+                self.log(f"[info] Logging in to QRZ as {user} ...")
+                a = qrz_xml_login(user, pw)
+                if a.using_xml:
+                    self.auth = a
+                    self.log("[info] QRZ session key obtained.")
+                else:
+                    self.log("[warn] QRZ XML login failed; proceeding without enrichment.")
+            else:
+                self.log("[info] Proceeding without QRZ XML enrichment.")
+            dlg.destroy()
+
+        ttk.Button(dlg, text="OK", command=do_ok).grid(row=4, column=0, columnspan=2, pady=8)
+
+        self.root.wait_window(dlg)
+
+    # ---------- Counties ----------
     def load_counties(self):
         st = (self.state_var.get() or "").upper().strip()
         if not st or st not in ALL_STATES:
@@ -706,64 +511,213 @@ class App:
             self.log(f"[info] Loading counties for {st} ...")
             sess = new_session()
             items = fetch_state_counties(sess, st)
+            total = len(items)
+            self.log(f"[info] County index filtered to {st}: {total} item(s)")
             items = sorted(items, key=lambda d: d["county"])
+
             self.state_counties[st] = items
             self.counties_listbox.delete(0, "end")
             for it in items:
                 self.counties_listbox.insert("end", it["county"])
-            self.log(f"[info] Counties loaded: {len(items)}")
+
+            if total == 0:
+                self.log("[warn] No counties matched this state. "
+                         "The QRZ index page may have shifted format or is temporarily incomplete.")
+            else:
+                self.log(f"[info] Counties loaded: {total}")
         except Exception as e:
             self.log(f"[error] Could not load counties: {e}")
 
-    def test_county_page(self):
+    def quick_self_test(self):
         st = (self.state_var.get() or "").upper().strip()
-        sel = self.counties_listbox.curselection()
-        if not sel:
-            messagebox.showinfo("Test", "Select a county in the list first.")
+        if not st or st not in self.state_counties:
+            messagebox.showinfo("Self-Test", "Load counties first.")
             return
-        county = self.counties_listbox.get(sel[0])
-        items = self.state_counties.get(st) or []
-        url = None
-        for it in items:
-            if it["county"] == county:
-                url = it["url"]; break
-        if not url:
-            self.log(f"[warn] No URL found for {county}, {st}. Load counties first.")
+        items = self.state_counties[st]
+        if not items:
+            messagebox.showinfo("Self-Test", "No counties loaded.")
             return
+        sample = items[0]
+        url = sample["url"]
+        self.log(f"[info] Self-Test: fetching sample county page → {sample['county']}, {st}")
         try:
             sess = new_session()
-            self.log(f"[info] Test county page: {county}, {st}")
-            html_text = get_html(sess, url)
-            calls, nxt = extract_calls_from_page(html_text)
-            self.log(f"[info] Found {len(calls)} calls on first page. next={'yes' if nxt else 'no'}")
+            html = get_html(sess, url, method="GET")
+            calls, next_url = extract_calls_from_page(html)
+            self.log(f"[info] Self-Test: extracted {len(calls)} call(s) from first page; next={bool(next_url)}")
+            if calls[:10]:
+                self.log("[info] Sample calls: " + ", ".join(calls[:10]))
         except Exception as e:
-            self.log(f"[error] Test county failed: {e}")
+            self.log(f"[error] Self-Test failed: {e}")
 
-    # --- Run / Stop -----------------------------------------------------------
-
+    # ---------- Run / Stop ----------
     def run_action(self):
-        # require login/API first
-        if not (self.api_key.get().strip() or (self.username.get().strip() and self.password.get().strip())):
-            messagebox.showerror("QRZ Login", "Please enter QRZ username+password or XML API key first.")
-            return
         if self.worker and self.worker.is_alive():
-            messagebox.showwarning("Busy", "A run is already in progress.")
+            messagebox.showinfo("Busy", "A job is already running. Press Stop to cancel.")
             return
-        self.progress["value"] = 0
-        self.worker = HarvesterThread(self)
+        self.stop_ev.clear()
+        self.btn_run.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        # Decide mode by presence of calls input or CSV
+        calls_raw = self.calls_in_var.get().strip()
+        csv_in = self.csv_path_var.get().strip()
+        if calls_raw or csv_in:
+            self.worker = threading.Thread(target=self.run_mode_a, daemon=True)
+        else:
+            self.worker = threading.Thread(target=self.run_mode_b, daemon=True)
         self.worker.start()
-        self.log("[info] Started.")
 
     def stop(self):
-        if self.worker and self.worker.is_alive():
-            self.worker.request_stop()
-            self.log("[info] Stop requested.")
+        self.stop_ev.set()
+        self.log("[info] Stop requested.")
+        # UI buttons will be flipped back by the thread's finally block
 
-# ---- main --------------------------------------------------------------------
+    # ---------- Mode A: direct calls / CSV ----------
+    def run_mode_a(self):
+        try:
+            self.log("[info] Mode A: processing calls")
+            calls = []
+            # parse manual
+            if self.calls_in_var.get().strip():
+                text = self.calls_in_var.get().upper()
+                for tok in re.split(r"[,\s]+", text):
+                    t = tok.strip().upper()
+                    if CALL_RE.match(t):
+                        calls.append(t)
+            # parse CSV
+            if self.csv_path_var.get().strip():
+                path = self.csv_path_var.get().strip()
+                if os.path.isfile(path):
+                    with open(path, newline="", encoding="utf-8") as f:
+                        rdr = csv.DictReader(f)
+                        for row in rdr:
+                            c = (row.get("callsign") or "").strip().upper()
+                            if CALL_RE.match(c):
+                                calls.append(c)
+                else:
+                    self.log(f"[warn] CSV not found: {path}")
+            calls = sorted(set(calls))
+            self.log(f"[info] {len(calls)} unique call(s) to process.")
 
+            out = []
+            if self.auth.using_xml and self.auth.session_key:
+                for i, c in enumerate(calls, 1):
+                    if self.stop_ev.is_set():
+                        break
+                    rec = qrz_xml_lookup(self.auth.session_key, c)
+                    out.append(rec)
+                    if i % 25 == 0:
+                        self.log(f"[info] Progress: {i}/{len(calls)}")
+                    time.sleep(0.15)
+            else:
+                # No enrichment; just output calls
+                out = [{"callsign": c} for c in calls]
+
+            self.write_outputs(out)
+            self.log(f"[info] Finished: {len(out)} record(s)")
+        except Exception as e:
+            self.log(f"[error] Mode A failed: {e}")
+        finally:
+            self.btn_run.config(state="normal")
+            self.btn_stop.config(state="disabled")
+
+    # ---------- Mode B: state + counties ----------
+    def run_mode_b(self):
+        try:
+            st = (self.state_var.get() or "").upper().strip()
+            if not st or st not in ALL_STATES:
+                self.log("[error] Choose a valid state on the Counties tab.")
+                return
+            items = self.state_counties.get(st)
+            if not items:
+                self.log("[error] Load counties first.")
+                return
+
+            sel_indices = list(self.counties_listbox.curselection())
+            if sel_indices:
+                chosen = [items[i] for i in sel_indices]
+            else:
+                chosen = items  # ALL
+            self.log(f"[info] Mode B: {st} / {len(chosen)} county(ies)")
+
+            sess = new_session()
+            calls: List[str] = []
+            for idx, county in enumerate(chosen, 1):
+                if self.stop_ev.is_set():
+                    break
+                self.log(f"[info] [{idx}/{len(chosen)}] Harvesting {county['county']}, {st} ...")
+                cs = harvest_county_calls(sess, county["url"], self.stop_ev, self.log)
+                before = len(calls)
+                for c in cs:
+                    if c not in calls:
+                        calls.append(c)
+                self.log(f"[info] Added {len(calls) - before} new call(s); total={len(calls)}")
+
+            calls = sorted(calls)
+            self.log(f"[info] Unique calls gathered: {len(calls)}")
+
+            # Enrich
+            out = []
+            if self.auth.using_xml and self.auth.session_key:
+                for i, c in enumerate(calls, 1):
+                    if self.stop_ev.is_set():
+                        break
+                    rec = qrz_xml_lookup(self.auth.session_key, c)
+                    out.append(rec)
+                    if i % 25 == 0:
+                        self.log(f"[info] Enrich progress: {i}/{len(calls)}")
+                    time.sleep(0.15)
+            else:
+                out = [{"callsign": c} for c in calls]
+
+            self.write_outputs(out)
+            self.log(f"[info] Finished: {len(out)} record(s)")
+        except Exception as e:
+            self.log(f"[error] Mode B failed: {e}")
+        finally:
+            self.btn_run.config(state="normal")
+            self.btn_stop.config(state="disabled")
+
+    # ---------- Write outputs ----------
+    def write_outputs(self, rows: List[Dict[str, str]]):
+        if not rows:
+            self.log("[info] Nothing to write.")
+            return
+        # Order columns
+        preferred = ["callsign","name","street","city","state","county","zip","grid","email"]
+        present = set()
+        for r in rows:
+            present.update(r.keys())
+        fieldnames = [k for k in preferred if k in present] + [k for k in sorted(present) if k not in preferred]
+
+        out_csv = self.out_csv_var.get().strip() or "output.csv"
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for r in rows:
+                w.writerow(r)
+        self.log(f"[info] Wrote CSV: {out_csv}")
+
+        if self.kml_enable.get():
+            try:
+                out_kml = os.path.splitext(out_csv)[0] + ".kml"
+                export_kml(rows, out_kml)
+                if HAVE_KML:
+                    self.log(f"[info] Wrote KML: {out_kml}")
+                else:
+                    self.log("[warn] simplekml not installed; KML skipped.")
+            except Exception as e:
+                self.log(f"[error] KML export failed: {e}")
+
+# ---- Main --------------------------------------------------------------------
 def main():
     root = tk.Tk()
-    app = App(root)
+    style = ttk.Style()
+    try:
+        style.theme_use("clam")
+    except Exception:
+        pass
+    App(root)
     root.mainloop()
 
 if __name__ == "__main__":
