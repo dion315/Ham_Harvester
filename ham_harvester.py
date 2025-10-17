@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Ham Harvester — QRZ county harvester (public website discovery) + QRZ XML enrich
+Ham Harvester — QRZ county harvester (public site via /db) + QRZ XML enrich
 
 What it does
 ------------
 1) Prompt-first QRZ login or XML session key (required for detail enrichment).
 2) Mode A: Callsigns/CSV -> QRZ XML lookup -> optional geocode -> export CSV/KML/HTML map.
-3) Mode B: State/County -> Scrape ALL calls from QRZ public "Advanced Search" results:
-     - discovers the live Advanced Search form (finds field names for state/county/status),
-       submits for each selected county with status=Active, paginates & collects calls.
-     - enrich every callsign via QRZ XML (name/street/city/state/county/zip/grid/email).
-4) Verbose logging, progress/ETA, Stop button.
+3) Mode B: State/Counties -> Uses QRZ public `/db` county index:
+     - Calls https://www.qrz.com/db with payload like:
+         query=*&cs=*&sel=&cmd=Search&mode=county&state=<ABBR>   (several fallbacks tried)
+       to retrieve the **official county list for that state** with links.
+     - Follows each county link, paginates, collects all callsigns.
+     - Enriches each callsign via QRZ XML (name/street/city/state/county/zip/grid/email).
+4) Verbose logging, progress/ETA, Stop button. Exports CSV/KML/HTML map.
 
 Notes
 -----
-- This interacts with **public qrz.com pages only** for the county list harvesting; you do NOT paste URLs.
-- If QRZ changes CSS/HTML heavily, you may need to adjust `discover_adv_form()` or `extract_calls_from_page()`.
-- XML enrichment requires a QRZ subscription with XML privileges.
-
-Tested
-------
-- Python 3.12 on Ubuntu with venv
+- Works only with public qrz.com and the QRZ XML API (for per-callsign detail).
+- If QRZ changes parameter names, this script already tries multiple variants and logs which worked.
+- If a CAPTCHA/login wall appears while scraping public pages, log in first (XML) — that often grants a cookie that also helps for /db pages.
 """
 
 import sys
@@ -77,12 +75,13 @@ import simplekml
 from bs4 import BeautifulSoup
 
 # ---- HTTP / globals ----
-APP_UA = "HamHarvester/QRZCounty/1.1 (+contact: you@example.com)"
+APP_UA = "HamHarvester/QRZCounty/1.2 (+contact: you@example.com)"
 HTTP = requests.Session()
 HTTP.headers.update({"User-Agent": APP_UA})
 
 QRZ_WEB_BASE   = "https://www.qrz.com"
 QRZ_XML_BASE   = "https://xmldata.qrz.com/xml/current/"
+QRZ_DB_URL     = "https://www.qrz.com/db"
 
 # conservative, US-centric callsign pattern (accept portable suffixes)
 CALL_RE = re.compile(r"^[A-Z0-9]{1,2}\d[A-Z]{1,3}(?:/[A-Z0-9]+)?$", re.I)
@@ -145,7 +144,6 @@ def qrz_login(username, password, verbose=False):
         if key: return key
     except Exception:
         pass
-    # GET fallback
     if verbose: print("[qrz_login] GET fallback")
     r = HTTP.get(QRZ_XML_BASE,
                  params={"username":username, "password":password},
@@ -194,185 +192,28 @@ def qrz_lookup_call(session_key: str, callsign: str) -> dict:
     data["address"] = ", ".join(parts)
     return data
 
-# ---- QRZ WEB scraping (public) ----
+# ---- public QRZ /db helpers ----
 
-ADV_SEARCH_ENTRY_URLS = [
-    # multiple entry points; we’ll try them in order
-    "/db/",                 # often redirects to database/lookup
-    "/",                    # homepage may have the form
-    "/lookup",              # some deployments
-    "/search",              # legacy
-]
-
-NEXT_TEXTS = {"next", "next >", "next »", "›", "»", "next›", "next»"}
-
-def get(url_path_or_abs: str) -> requests.Response:
-    url = url_path_or_abs if url_path_or_abs.startswith("http") else urljoin(QRZ_WEB_BASE, url_path_or_abs)
+def http_get(url_or_path: str) -> requests.Response:
+    url = url_or_path if url_or_path.startswith("http") else urljoin(QRZ_WEB_BASE, url_or_path)
     r = HTTP.get(url, timeout=45, headers={"User-Agent": APP_UA})
     r.raise_for_status()
     return r
 
-def discover_adv_form(log) -> dict:
-    """
-    Return a dict with:
-      {
-        "action": <absolute URL>,
-        "method": "get" or "post",
-        "fields": {
-            "state": {"name": fieldname, "value_map": {"NY":"NY", ...}} or None,
-            "county":{"name": fieldname, "is_select": True/False},
-            "status":{"name": fieldname, "value_active": <value that selects Active status>, "has_active": True/False}
-        },
-        "raw_inputs": {<name>: <default or "">}   # other inputs we should pass through
-      }
-    It scans several public pages and picks the first form that exposes state/county.
-    """
-    for entry in ADV_SEARCH_ENTRY_URLS:
-        try:
-            r = get(entry)
-        except Exception as e:
-            log(f"[info] Could not open {entry}: {e}")
-            continue
-        soup = BeautifulSoup(r.text, "lxml")
-        forms = soup.find_all("form")
-        for form in forms:
-            # Collect inputs/selects
-            selects = form.find_all("select")
-            inputs  = form.find_all("input")
-            # Heuristics to locate state & county widgets
-            state_info = None
-            county_info = None
-            status_info = {"name": None, "value_active": None, "has_active": False}
-
-            # try to find a select with many US states
-            for sel in selects:
-                opts = sel.find_all("option")
-                values = { (o.get("value") or o.text).strip() for o in opts if (o.get("value") or o.text) }
-                # match by intersection with US_STATES keys/names
-                abbr_hits = len(values.intersection(set(US_STATES.keys())))
-                name_hits = len({v for v in values if v in US_STATES.values()})
-                if abbr_hits >= 30 or name_hits >= 30:
-                    state_info = {"name": sel.get("name"), "value_map": {}}
-                    for o in opts:
-                        label = (o.text or "").strip()
-                        val   = (o.get("value") or label).strip()
-                        # map both abbr and full name if possible
-                        if label in US_STATES.values():
-                            # find abbr key for this full name
-                            abbr = next((k for k,v in US_STATES.items() if v == label), None)
-                            if abbr: state_info["value_map"][abbr] = val
-                        if label in US_STATES:
-                            state_info["value_map"][label] = val
-                    # fallback populate with abbr->val for labels that are abbrs
-                    break
-
-            # county select (or text input)
-            # look for select whose id/name includes 'county'
-            county_candidates = [sel for sel in selects if "county" in (sel.get("name","").lower()+sel.get("id","").lower())]
-            if county_candidates:
-                csel = county_candidates[0]
-                county_info = {"name": csel.get("name"), "is_select": True}
-            else:
-                # maybe text input
-                text_candidates = [inp for inp in inputs if (inp.get("type","text").lower() in ("text","search"))
-                                   and "county" in (inp.get("name","").lower()+inp.get("id","").lower())]
-                if text_candidates:
-                    county_info = {"name": text_candidates[0].get("name"), "is_select": False}
-
-            # status control (want "Active")
-            # look for select with options containing "Active"
-            for sel in selects:
-                opts = sel.find_all("option")
-                labset = {(o.text or "").strip().lower(): (o.get("value") or o.text or "").strip() for o in opts}
-                if "active" in labset:
-                    status_info = {"name": sel.get("name"), "value_active": labset["active"], "has_active": True}
-                    break
-            # Or radio/buttons for active?
-            if not status_info["has_active"]:
-                for inp in inputs:
-                    lab = (inp.get("value") or "").strip().lower()
-                    nm  = (inp.get("name") or "").strip()
-                    typ = (inp.get("type") or "").strip().lower()
-                    if typ in ("radio","checkbox") and nm and lab == "active":
-                        status_info = {"name": nm, "value_active": inp.get("value"), "has_active": True}
-                        break
-
-            if state_info and county_info:
-                # collect other inputs to preserve CSRF/hidden fields if GET/POST is used
-                raw_inputs = {}
-                for inp in inputs:
-                    nm = inp.get("name")
-                    if not nm: continue
-                    if nm in (state_info["name"], county_info["name"], status_info["name"]): continue
-                    raw_inputs[nm] = inp.get("value","")
-
-                method = (form.get("method") or "get").lower()
-                action = form.get("action") or r.url
-                action_abs = action if action.startswith("http") else urljoin(r.url, action)
-
-                return {
-                    "action": action_abs,
-                    "method": method,
-                    "fields": {"state": state_info, "county": county_info, "status": status_info},
-                    "raw_inputs": raw_inputs
-                }
-        # try next entry page
-    raise RuntimeError("Could not discover QRZ Advanced Search form on public pages.")
-
-def submit_adv_search(discovery: dict, state_abbr: str, county_label: str, log) -> str:
-    """
-    Build and submit one Advanced Search for a (state, county) with status=Active.
-    Return the HTML text of the first results page.
-    """
-    action  = discovery["action"]
-    method  = discovery["method"]
-    fields  = discovery["fields"]
-    raw_in  = dict(discovery["raw_inputs"])
-
-    # map state abbr to the select's value
-    st_name = fields["state"]["name"]
-    st_val_map = fields["state"]["value_map"]
-    if state_abbr not in st_val_map:
-        # fallback: maybe the form uses full names
-        full = US_STATES.get(state_abbr, state_abbr)
-        # try to find a matching key by label
-        # (use first value if nothing matches; user can adjust later)
-        st_value = next(iter(st_val_map.values())) if st_val_map else state_abbr
-    else:
-        st_value = st_val_map[state_abbr]
-
-    # county
-    c_name = fields["county"]["name"]
-    payload = {st_name: st_value, c_name: county_label}
-
-    # status=Active
-    if fields["status"]["name"] and fields["status"]["has_active"]:
-        payload[fields["status"]["name"]] = fields["status"]["value_active"]
-
-    # merge raw inputs
-    payload.update({k:(v or "") for k,v in raw_in.items()})
-
-    if method == "post":
-        r = HTTP.post(action, data=payload, timeout=45, headers={"User-Agent": APP_UA})
-    else:
-        url = action + ("&" if "?" in action else "?") + urlencode(payload, doseq=True)
-        r = HTTP.get(url, timeout=45, headers={"User-Agent": APP_UA})
+def http_get_with_params(url: str, params: dict) -> requests.Response:
+    r = HTTP.get(url, params=params, timeout=45, headers={"User-Agent": APP_UA})
     r.raise_for_status()
-    return r.text
+    return r
 
-def extract_calls_from_page(html: str, base_url: str) -> tuple[list[str], str|None]:
+def extract_calls_and_next(html: str, base_url: str) -> tuple[list[str], str|None]:
     """
-    Extract callsigns and a 'next page' URL (absolute) from a result page.
-    Strategy:
-      - Prefer <a> links to /db/<CALL> or /lookup/<CALL> where anchor text matches callsign.
-      - Fallback: look for table cells that look like callsigns.
-      - Find pagination anchors with 'next' text.
+    Extract callsigns from a QRZ result page and a possible next-page URL.
     """
     soup = BeautifulSoup(html, "lxml")
     calls = []
-    seen = set()
+    seen  = set()
 
-    # links
+    # primary: links to /db/<CALL> or /lookup/<CALL> with anchor text == callsign
     for a in soup.select("a[href]"):
         href = a.get("href","")
         text = (a.get_text() or "").strip()
@@ -382,7 +223,7 @@ def extract_calls_from_page(html: str, base_url: str) -> tuple[list[str], str|No
                 seen.add(cu); calls.append(cu)
 
     if not calls:
-        # table cells fallback
+        # fallback: table cells
         for td in soup.select("table td, table th"):
             t = (td.get_text() or "").strip()
             if is_callsign(t):
@@ -390,64 +231,118 @@ def extract_calls_from_page(html: str, base_url: str) -> tuple[list[str], str|No
                 if cu not in seen:
                     seen.add(cu); calls.append(cu)
 
-    # find next page
+    # next page candidates
     next_href = None
-    # try rel=next first
     a_next = soup.find("a", rel=lambda x: x and "next" in x.lower())
     if a_next and a_next.get("href"):
         next_href = urljoin(base_url, a_next["href"])
     else:
-        # fallback by anchor text
         for a in soup.select("a[href]"):
             lbl = (a.get_text() or "").strip().lower()
-            if lbl in NEXT_TEXTS:
+            if lbl in {"next", "next >", "next »", "›", "»", "next›", "next»"}:
                 next_href = urljoin(base_url, a["href"])
                 break
 
     return calls, next_href
 
-def harvest_qrz_by_county(state_abbr: str, counties: list[str], log) -> list[str]:
+def qrz_county_index_for_state(state_abbr: str, log) -> dict:
     """
-    Discover the advanced form once, then enumerate calls for each county.
-    Returns a de-duplicated list of callsigns.
+    Hit https://www.qrz.com/db with the 'county mode' payload (and fallbacks)
+    to obtain a list of counties and their result links for the given state.
+    Returns: { county_name: absolute_url_to_results }
     """
-    log(f"[info] Discovering QRZ Advanced Search form...")
-    disc = discover_adv_form(log)
-    log(f"[info] Using action={disc['action']} method={disc['method']}")
+    # Primary payload per user guidance
+    base_payloads = [
+        {"query":"*","cs":"*","sel":"","cmd":"Search","mode":"county","state":state_abbr},
+        {"query":"*","cs":"*","cmd":"Search","mode":"county","state":state_abbr},
+        {"query":"*","cs":"*","sel":"","cmd":"Search","mode":"county","st":state_abbr},
+        {"query":"*","cs":"*","cmd":"Search","mode":"county","st":state_abbr},
+        # uppercase fallbacks (some sites care)
+        {"QUERY":"*","CS":"*","SEL":"","CMD":"Search","MODE":"county","STATE":state_abbr},
+        {"QUERY":"*","CS":"*","CMD":"Search","MODE":"county","STATE":state_abbr},
+        {"QUERY":"*","CS":"*","CMD":"Search","MODE":"county","ST":state_abbr},
+    ]
 
-    all_calls = []
-    seen = set()
-
-    for county in counties:
-        log(f"[info] QRZ search: {state_abbr} / {county} (Active)")
+    last_err = None
+    for payload in base_payloads:
         try:
-            html = submit_adv_search(disc, state_abbr, county, log)
+            log(f"[info] QRZ county index query: {payload}")
+            r = http_get_with_params(QRZ_DB_URL, payload)
+            soup = BeautifulSoup(r.text, "lxml")
+
+            # Strategy: find the list/table of counties; anchors likely say "<County> County"
+            county_map = {}
+            for a in soup.select("a[href]"):
+                label = (a.get_text() or "").strip()
+                if not label:
+                    continue
+                # Normalize label -> "Madison" even if "Madison County" or "MADISON County"
+                if "county" in label.lower():
+                    cname = label.replace("County", "").replace("COUNTY","").strip()
+                    href = a.get("href")
+                    if href:
+                        county_map[cname] = urljoin(r.url, href)
+
+            # Fallback heuristic: anchors whose href contains something county-like
+            if not county_map:
+                for a in soup.select("a[href]"):
+                    href = (a.get("href") or "")
+                    if "county" in href.lower() or "co=" in href.lower():
+                        label = (a.get_text() or "").strip()
+                        if label:
+                            cname = label.replace("County", "").replace("COUNTY","").strip()
+                        else:
+                            # last-ditch: take query arg value-ish chunk
+                            cname = " ".join(re.findall(r"(?:county|co)=([^&]+)", href, flags=re.I)) or href
+                            cname = cname.replace("+"," ").strip().title()
+                        county_map[cname] = urljoin(r.url, href)
+
+            if county_map:
+                # Clean dupes / blank keys
+                county_map = {k:v for k,v in county_map.items() if k}
+                log(f"[info] County index loaded: {len(county_map)} counties")
+                return county_map
+
+            # Save last error-like state
+            last_err = "No counties parsed from response."
         except Exception as e:
-            log(f"[error] submit failed for {state_abbr} / {county}: {e}")
+            last_err = str(e)
+            log(f"[error] County index attempt failed: {e}")
+
+    raise RuntimeError(f"Could not retrieve county index for {state_abbr}. Last error: {last_err}")
+
+def harvest_qrz_from_county_urls(county_urls: list[str], log) -> list[str]:
+    """
+    Given one or more county result URLs from /db, walk and collect calls (with pagination).
+    """
+    all_calls, seen = [], set()
+    for url in county_urls:
+        log(f"[info] Harvesting county URL: {url}")
+        try:
+            r = http_get(url)
+            html, page_url = r.text, r.url
+        except Exception as e:
+            log(f"[error] county URL fetch failed: {e}")
             continue
 
-        # walk pagination
-        page_url = disc["action"]
         page = 1
         while True:
-            found, next_url = extract_calls_from_page(html, page_url)
+            found, next_url = extract_calls_and_next(html, page_url)
+            new = 0
             for cs in found:
                 if cs not in seen:
-                    seen.add(cs); all_calls.append(cs)
-            log(f"[info]  page {page}: +{len(found)} (total {len(all_calls)})")
-            if not next_url:
-                break
+                    seen.add(cs); all_calls.append(cs); new += 1
+            log(f"[info]  page {page}: +{new} (total {len(all_calls)})")
+            if not next_url: break
             try:
-                r = get(next_url)
-                html = r.text
-                page_url = r.url
+                r = http_get(next_url)
+                html, page_url = r.text, r.url
                 page += 1
-                time.sleep(0.5)  # polite pause
+                time.sleep(0.5)
             except Exception as e:
                 log(f"[error] next page fetch failed: {e}")
                 break
-
-    log(f"[info] Harvest complete: {len(all_calls)} calls.")
+    log(f"[info] Harvest complete: {len(all_calls)} unique calls")
     return all_calls
 
 # ---- Geocoding ----
@@ -476,11 +371,12 @@ def geocode_addr(address: str, mode: str, google_key: str, email_contact: str):
 # ---- Worker ----
 class Worker(threading.Thread):
     def __init__(self, mode, session_key, items, state_abbr, counties,
-                 geocode_mode, google_key, email_contact, out_q, verbose=False):
+                 geocode_mode, google_key, email_contact, out_q, verbose=False,
+                 county_url_map=None):
         super().__init__(daemon=True)
         self.mode = mode            # "calls" or "county"
         self.session_key = session_key
-        self.items = items          # list[calls] for "calls"; ignored for "county"
+        self.items = items          # list[calls] for "calls"; unused for "county"
         self.state_abbr = state_abbr
         self.counties = counties or []
         self.geocode_mode = geocode_mode
@@ -489,6 +385,7 @@ class Worker(threading.Thread):
         self.q = out_q
         self.verbose = verbose
         self.stop_event = threading.Event()
+        self.county_url_map = county_url_map or {}
 
     def stop(self): self.stop_event.set()
 
@@ -498,7 +395,12 @@ class Worker(threading.Thread):
 
         # Build calls
         if self.mode == "county":
-            calls = harvest_qrz_by_county(self.state_abbr, self.counties, log=lambda m: self.q.put(("log", m)))
+            urls = []
+            for c in self.counties:
+                u = self.county_url_map.get(c)
+                if u: urls.append(u)
+                else: self.q.put(("log", f"[info] Skipping (no URL): {c}"))
+            calls = harvest_qrz_from_county_urls(urls, log=lambda m: self.q.put(("log", m)))
         else:
             calls = self.items
 
@@ -545,7 +447,7 @@ class Worker(threading.Thread):
 class App:
     def __init__(self, root):
         self.root = root
-        root.title("Ham Harvester — QRZ County (public) + XML Enrich")
+        root.title("Ham Harvester — QRZ /db county + XML enrich")
         root.rowconfigure(2, weight=1)
         root.columnconfigure(0, weight=1)
 
@@ -553,6 +455,10 @@ class App:
         self.worker = None
         self.records = []
         self.queue = queue.Queue()
+
+        # cache: state -> {county_name: url}
+        self.state_county_cache = {}
+        self.county_url_map = {}
 
         main = ttk.Frame(root, padding=10); main.grid(row=0, column=0, sticky="nsew")
         main.columnconfigure(1, weight=1)
@@ -575,7 +481,7 @@ class App:
         # Modes
         self.mode = tk.StringVar(value="county")
         ttk.Radiobutton(main, text="A) Callsigns / CSV", variable=self.mode, value="calls", command=self.update_mode).grid(row=5, column=0, sticky="w")
-        ttk.Radiobutton(main, text="B) State / Counties (QRZ public)", variable=self.mode, value="county", command=self.update_mode).grid(row=5, column=1, sticky="w")
+        ttk.Radiobutton(main, text="B) State / Counties (QRZ /db county index)", variable=self.mode, value="county", command=self.update_mode).grid(row=5, column=1, sticky="w")
 
         # Calls input
         callsf = ttk.LabelFrame(main, text="Callsigns Input")
@@ -589,7 +495,7 @@ class App:
         self.calls_text = scrolledtext.ScrolledText(callsf, height=4); self.calls_text.grid(row=1, column=1, columnspan=2, sticky="we")
 
         # County input
-        countyf = ttk.LabelFrame(main, text="County Harvester")
+        countyf = ttk.LabelFrame(main, text="County Harvester (QRZ /db)")
         countyf.grid(row=7, column=0, columnspan=3, sticky="we")
         countyf.columnconfigure(1, weight=1)
         ttk.Label(countyf, text="State:").grid(row=0, column=0, sticky="w")
@@ -603,9 +509,9 @@ class App:
         ttk.Checkbutton(countyf, text="All counties in state", variable=self.all_counties_var,
                         command=self.toggle_all_counties).grid(row=1, column=0, sticky="w", pady=(4,2))
         ttk.Label(countyf, text="Counties (multi-select):").grid(row=2, column=0, sticky="nw")
-        self.county_list = tk.Listbox(countyf, selectmode="extended", height=8, exportselection=False)
+        self.county_list = tk.Listbox(countyf, selectmode="extended", height=10, exportselection=False)
         self.county_list.grid(row=2, column=1, sticky="we", padx=4)
-        ttk.Button(countyf, text="Reload Counties", command=self.load_counties).grid(row=2, column=2, sticky="w")
+        ttk.Button(countyf, text="Load/Refresh from QRZ", command=self.load_counties).grid(row=2, column=2, sticky="w")
 
         # Geocoding + controls
         geof = ttk.LabelFrame(main, text="Geocoding")
@@ -678,7 +584,6 @@ class App:
                 pass
         # calls widgets
         set_state(self.calls_text, m=="calls")
-        # csv entry & browse button
         for w in self.calls_text.master.grid_slaves(row=0):
             try: w.configure(state=("normal" if m=="calls" else "disabled"))
             except: pass
@@ -686,7 +591,7 @@ class App:
         set_state(self.state_combo, m=="county")
         set_state(self.county_list, m=="county")
 
-    # ----- county list -----
+    # ----- county loading from QRZ /db -----
     def toggle_all_counties(self):
         if self.all_counties_var.get():
             self.county_list.selection_set(0, "end")
@@ -695,27 +600,28 @@ class App:
 
     def load_counties(self):
         abbr = (self.state_var.get() or "NY").split("—")[0].strip()
-        self.log(f"[info] Loading counties for {abbr} ...")
-        # Use a compact list from Census ACS (static endpoints change; keep a safe fallback)
+        self.log(f"[info] Loading counties for {abbr} from QRZ /db ...")
+        # use cache if available
+        if abbr in self.state_county_cache:
+            self.county_url_map = self.state_county_cache[abbr].copy()
+            self._populate_county_list(self.county_url_map)
+            return
         try:
-            # Simple fallback bundle (minimal to avoid web calls here)
-            # You can expand or wire a live county loader if you prefer.
-            fallback = {
-                "NY": ["Albany","Allegany","Bronx","Broome","Cattaraugus","Cayuga","Chautauqua","Chemung","Chenango",
-                       "Clinton","Columbia","Cortland","Delaware","Dutchess","Erie","Essex","Franklin","Fulton",
-                       "Genesee","Greene","Hamilton","Herkimer","Jefferson","Kings","Lewis","Livingston","Madison",
-                       "Monroe","Montgomery","Nassau","New York","Niagara","Oneida","Onondaga","Ontario","Orange",
-                       "Orleans","Oswego","Otsego","Putnam","Queens","Rensselaer","Richmond","Rockland","St. Lawrence",
-                       "Saratoga","Schenectady","Schoharie","Schuyler","Seneca","Steuben","Suffolk","Sullivan","Tioga",
-                       "Tompkins","Ulster","Warren","Washington","Wayne","Westchester","Wyoming","Yates"]
-            }
-            counties = fallback.get(abbr, [])
-            self.county_list.delete(0, "end")
-            for c in counties:
-                self.county_list.insert("end", c)
-            self.log(f"[info] Counties loaded: {len(counties)}")
+            county_map = qrz_county_index_for_state(abbr, log=self.log)
+            if not county_map:
+                raise RuntimeError("No counties returned.")
+            self.state_county_cache[abbr] = county_map.copy()
+            self.county_url_map = county_map
+            self._populate_county_list(county_map)
         except Exception as e:
-            self.log(f"[error] Could not load counties: {e}")
+            self.log(f"[error] Could not load counties for {abbr}: {e}")
+            # leave previous list intact
+
+    def _populate_county_list(self, cmap: dict):
+        self.county_list.delete(0, "end")
+        for name in sorted(cmap.keys(), key=lambda s: s.lower()):
+            self.county_list.insert("end", name)
+        self.log(f"[info] Counties loaded: {self.county_list.size()}")
 
     # ----- file browse -----
     def browse_csv(self):
@@ -791,6 +697,13 @@ class App:
             if not counties:
                 messagebox.showinfo("No counties", "Select at least one county or check All counties.")
                 return
+            # ensure county_url_map is ready
+            if abbr not in self.state_county_cache:
+                self.load_counties()
+                if abbr not in self.state_county_cache:
+                    messagebox.showerror("QRZ", "Could not load county list from QRZ.")
+                    return
+            self.county_url_map = self.state_county_cache[abbr].copy()
             items = []  # not used in county mode
             self.progress["maximum"] = 1
             self.log(f"[info] Mode B: {abbr} / {len(counties)} county(ies)")
@@ -810,7 +723,8 @@ class App:
             google_key=(self.google_var.get() or "").strip(),
             email_contact=(self.email_var.get() or "you@example.com").strip(),
             out_q=self.queue,
-            verbose=self.verbose.get()
+            verbose=self.verbose.get(),
+            county_url_map=self.county_url_map
         )
         self.worker.start()
 
@@ -950,8 +864,8 @@ L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZo
 
 def main():
     root = tk.Tk()
-    # make log area stretch
-    root.rowconfigure(2, weight=1); root.columnconfigure(0, weight=1)
+    root.rowconfigure(2, weight=1)
+    root.columnconfigure(0, weight=1)
     app = App(root)
     root.mainloop()
 
